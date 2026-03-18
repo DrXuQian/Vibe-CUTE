@@ -139,10 +139,45 @@ __global__ void MarlinCute(
   int* locks
 ) {
   // ========================================================================
-  // CTA Dispatcher
-  // Uses immutable base pointers + par_m_idx offset instead of mutating
-  // A/C/locks pointers directly.
+  // CTA Dispatcher — TileWorkDesc
+  // Clean tile-based work description replacing scattered slice_* variables.
+  // Each CTA gets a contiguous range of K-iterations [block_iter_begin, end).
+  // A tile = one (m_idx, n_idx) output tile requiring a full K reduction.
   // ========================================================================
+
+  struct TileWorkDesc {
+    int tile_idx;       // flat index in (m_parallel * n_tiles) space
+    int m_idx, n_idx;   // 2D tile coordinate
+    int k_iter_begin;   // K start within tile (0 = tile start)
+    int k_iter_end;     // K end within tile
+    int k_iters_remaining;
+    int slice_count;    // CTAs contributing to this tile
+    int slice_idx;      // this CTA's rank (0 = goes first in barrier = highest K)
+
+    __device__ void init(int k_tiles, int n_tiles, int iters_per_block,
+                         int tile_idx_, int block_begin, int block_end) {
+      tile_idx = tile_idx_;
+      m_idx = tile_idx / n_tiles;
+      n_idx = tile_idx % n_tiles;
+      int tile_k_begin = tile_idx * k_tiles;
+      int tile_k_end = tile_k_begin + k_tiles;
+      k_iter_begin = max(block_begin, tile_k_begin) - tile_k_begin;
+      k_iter_end = min(block_end, tile_k_end) - tile_k_begin;
+      k_iters_remaining = max(0, k_iter_end - k_iter_begin);
+
+      // Compute slice_count and slice_idx (matching original Marlin ordering)
+      // slice_idx=0: highest K (goes first in barrier), slice_idx=count-1: lowest K (last)
+      int first_block = tile_k_begin / iters_per_block;
+      int last_block_global = (tile_k_end - 1) / iters_per_block;
+      slice_count = last_block_global - first_block + 1;
+      // Reverse: highest block (highest K) → slice_idx=0
+      slice_idx = last_block_global - (block_begin / iters_per_block);
+    }
+    __device__ bool is_first()   const { return slice_idx == 0; }
+    __device__ bool is_last()    const { return slice_idx == slice_count - 1; }
+    __device__ bool is_splited() const { return slice_count > 1; }
+  };
+
   int parallel = 1;
   if (prob_m > 16 * thread_m_blocks) {
     parallel = prob_m / (16 * thread_m_blocks);
@@ -151,61 +186,24 @@ __global__ void MarlinCute(
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
-  int iters = ceildiv_cute(k_tiles * n_tiles * parallel, gridDim.x);
+  int total_iters = k_tiles * n_tiles * parallel;
+  int iters_per_block = ceildiv_cute(total_iters, gridDim.x);
   if (group_blocks != -1)
-    iters = (group_blocks / thread_k_blocks) * ceildiv_cute(iters, (group_blocks / thread_k_blocks));
+    iters_per_block = (group_blocks / thread_k_blocks) * ceildiv_cute(iters_per_block, (group_blocks / thread_k_blocks));
 
-  int slice_row = (iters * blockIdx.x) % k_tiles;
-  int slice_col_par = (iters * blockIdx.x) / k_tiles;
-  int slice_col = slice_col_par;
-  int slice_iters;
-  int slice_count = 0;
-  int slice_idx;
+  int block_iter_begin = blockIdx.x * iters_per_block;
+  int block_iter_end = min(block_iter_begin + iters_per_block, total_iters);
+  int remaining_iters = block_iter_end - block_iter_begin;
+  if (remaining_iters <= 0) return;  // CTA has no work
 
-  // Track M-parallel offset via index instead of pointer mutation
-  // par_m_idx counts how many (16 * thread_m_blocks) M-blocks we've advanced
-  int par_m_idx = 0;
-  if (slice_col_par >= n_tiles) {
-    par_m_idx = slice_col_par / n_tiles;
-    slice_col = slice_col_par % n_tiles;
-  }
+  int tile_idx = block_iter_begin / k_tiles;
+  TileWorkDesc tile_work;
+  tile_work.init(k_tiles, n_tiles, iters_per_block, tile_idx, block_iter_begin, block_iter_end);
 
-  // Compute current A/C/locks from immutable base + par_m_idx
-  auto cur_A = [&]() -> const int4* { return A + par_m_idx * 16 * thread_m_blocks * prob_k / 8; };
-  auto cur_C = [&]() -> int4* { return C + par_m_idx * 16 * thread_m_blocks * prob_n / 8; };
-  auto cur_locks = [&]() -> int* { return locks + par_m_idx * n_tiles; };
-
-  auto init_slice = [&] () {
-    slice_iters = iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
-    if (slice_iters < 0 || slice_col_par >= n_tiles * parallel)
-      slice_iters = 0;
-    if (slice_iters == 0)
-      return;
-    if (slice_row + slice_iters > k_tiles)
-      slice_iters = k_tiles - slice_row;
-    slice_count = 1;
-    slice_idx = 0;
-    int col_first = iters * ceildiv_cute(k_tiles * slice_col_par, iters);
-    if (col_first <= k_tiles * (slice_col_par + 1)) {
-      int col_off = col_first - k_tiles * slice_col_par;
-      slice_count = ceildiv_cute(k_tiles - col_off, iters);
-      if (col_off > 0)
-        slice_count++;
-      int delta_first = iters * blockIdx.x - col_first;
-      if (delta_first < 0 || (col_off == 0 && delta_first == 0))
-        slice_idx = slice_count - 1;
-      else {
-        slice_idx = slice_count - 1 - delta_first / iters;
-        if (col_off > 0)
-          slice_idx--;
-      }
-    }
-    if (slice_col == n_tiles) {
-      par_m_idx++;  // advance to next M-parallel block
-      slice_col = 0;
-    }
-  };
-  init_slice();
+  // Compute current A/C/locks from tile coordinate
+  auto cur_A = [&]() -> const int4* { return A + tile_work.m_idx * 16 * thread_m_blocks * prob_k / 8; };
+  auto cur_C = [&]() -> int4* { return C + tile_work.m_idx * 16 * thread_m_blocks * prob_n / 8; };
+  auto cur_locks = [&]() -> int* { return locks + tile_work.m_idx * n_tiles; };
 
   // ========================================================================
   // CuTe Layout Definitions
@@ -295,19 +293,19 @@ __global__ void MarlinCute(
   using SmemCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, cute::half_t>;
 
   // ========================================================================
-  // Per-Thread Index Computation
+  // Per-Thread Index Computation (derived from tile_work)
   // ========================================================================
 
-  // A matrix: K-column base offset for pipeline (replaces a_gl_rd)
-  int a_k_col = A_TILE_K_HALF * slice_row;  // in half_t units
-
-  // B matrix: tracked via 2D offsets (replaces B_ptr[] and b_gl_rd)
-  int b_k_row = thread_k_blocks * slice_row;  // current K-row offset in B's global layout
-  int b_n_col = b_sh_stride * slice_col;       // current N-col offset
-  int b_sh_rd = threadIdx.x;                   // smem read index (flat, identity mapping)
-
-  // Scale indices
-  int s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + s_sh_stride * slice_col + threadIdx.x;
+  // Data offsets computed from tile_work, updated when tile changes
+  int a_k_col = A_TILE_K_HALF * tile_work.k_iter_begin;
+  int b_k_row = thread_k_blocks * tile_work.k_iter_begin;
+  int b_n_col = b_sh_stride * tile_work.n_idx;
+  int b_sh_rd = threadIdx.x;
+  int s_gl_rd;
+  if constexpr (group_blocks != -1)
+    s_gl_rd = s_gl_stride * ((thread_k_blocks * tile_work.k_iter_begin) / group_blocks) + s_sh_stride * tile_work.n_idx + threadIdx.x;
+  else
+    s_gl_rd = s_sh_stride * tile_work.n_idx + threadIdx.x;
   int s_sh_wr = threadIdx.x;
   int s_sh_rd;
   if (group_blocks != -1)
@@ -572,7 +570,7 @@ __global__ void MarlinCute(
       int c_gl_wr_delta_o = 8 * c_gl_stride;
       int c_gl_wr_delta_i = 4 * (active_threads / 32);
       int c_gl_wr = c_gl_stride * ((threadIdx.x % 32) / 4) + 4 * (threadIdx.x / 32) + threadIdx.x % 4;
-      c_gl_wr += (2 * thread_n_blocks) * slice_col;
+      c_gl_wr += (2 * thread_n_blocks) * tile_work.n_idx;
       constexpr int c_sh_wr_delta = active_threads;
       int c_sh_wr = threadIdx.x;
 
@@ -628,7 +626,7 @@ __global__ void MarlinCute(
     constexpr int c_sh_rd_delta = c_sh_stride * (threads / (2 * thread_n_blocks));
 
     int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * thread_n_blocks)) + (threadIdx.x % (2 * thread_n_blocks));
-    c_gl_wr += (2 * thread_n_blocks) * slice_col;
+    c_gl_wr += (2 * thread_n_blocks) * tile_work.n_idx;
     int c_sh_wr = (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
     c_sh_wr += 32 * (threadIdx.x / 32);
     int c_sh_rd = c_sh_stride * (threadIdx.x / (2 * thread_n_blocks)) + (threadIdx.x % (2 * thread_n_blocks));
@@ -680,7 +678,7 @@ __global__ void MarlinCute(
     zero_accums();
     #pragma unroll
     for (int i = 0; i < stages - 1; i++)
-      fetch_to_shared(i, i, i < slice_iters);
+      fetch_to_shared(i, i, i < tile_work.k_iters_remaining);
     wait_for_stage();
     fetch_to_registers(0, 0);
     a_k_col += A_TILE_K_HALF * (stages - 1);
@@ -691,71 +689,81 @@ __global__ void MarlinCute(
   // Main Loop
   // ========================================================================
 
-  while (slice_iters) {
-    #pragma unroll
-    for (int pipe = 0; pipe < stages;) {
+  #pragma unroll 1
+  while (true) {
+    remaining_iters -= tile_work.k_iters_remaining;
+
+    // Main K loop for current tile
+    #pragma unroll 1
+    while (tile_work.k_iters_remaining) {
       #pragma unroll
-      for (int k = 0; k < b_sh_wr_iters; k++) {
-        fetch_to_registers(k + 1, pipe % stages);
-        if (k == b_sh_wr_iters - 2) {
-          fetch_to_shared((pipe + stages - 1) % stages, pipe, slice_iters >= stages);
-          pipe++;
-          wait_for_stage();
+      for (int pipe = 0; pipe < stages;) {
+        #pragma unroll
+        for (int k = 0; k < b_sh_wr_iters; k++) {
+          fetch_to_registers(k + 1, pipe % stages);
+          if (k == b_sh_wr_iters - 2) {
+            fetch_to_shared((pipe + stages - 1) % stages, pipe, tile_work.k_iters_remaining >= stages);
+            pipe++;
+            wait_for_stage();
+          }
+          matmul(k);
         }
-        matmul(k);
+        tile_work.k_iters_remaining--;
+        if (tile_work.k_iters_remaining == 0)
+          break;
       }
-      slice_iters--;
-      if (slice_iters == 0)
-        break;
+      a_k_col += A_TILE_K_HALF * stages;
     }
-    a_k_col += A_TILE_K_HALF * stages;
 
-    // Post-processing: reduce and possibly move to next column slice
-    if (slice_iters == 0) {
+    // ---- Epilog for current tile ----
+    cute::cp_async_wait<0>();
+
+    // Per-column scales: fetch in the final step before write-out
+    if (group_blocks == -1 && tile_work.is_last()) {
+      if (s_sh_wr_pred) {
+        auto src = make_tensor(make_gmem_ptr(&s[s_gl_rd]), Int<1>{});
+        auto dst = make_tensor(make_smem_ptr(&sh_s[s_sh_wr]), Int<1>{});
+        copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, int4>{}, src, dst);
+      }
+      cute::cp_async_fence();
+    }
+
+    thread_block_reduce();
+
+    if (group_blocks == -1 && tile_work.is_last()) {
       cute::cp_async_wait<0>();
-      bool last = slice_idx == slice_count - 1;
-
-      // Per-column scales: fetch in the final step before write-out
-      if (group_blocks == -1 && last) {
-        if (s_sh_wr_pred) {
-          auto src = make_tensor(make_gmem_ptr(&s[s_gl_rd]), Int<1>{});
-          auto dst = make_tensor(make_smem_ptr(&sh_s[s_sh_wr]), Int<1>{});
-          copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, int4>{}, src, dst);
-        }
-        cute::cp_async_fence();
-      }
-
-      thread_block_reduce();
-
-      if (group_blocks == -1 && last) {
-        cute::cp_async_wait<0>();
-        __syncthreads();
-        if (threadIdx.x / 32 < thread_n_blocks / 4) {
-          reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd + 0];
-          reinterpret_cast<int4*>(&frag_s)[1] = sh_s[s_sh_rd + 4];
-        }
-      }
-
-      if (slice_count > 1) {
-        marlin_cute::barrier_acquire(&cur_locks()[slice_col], slice_idx);
-        global_reduce(slice_idx == 0, last);
-        marlin_cute::barrier_release(&cur_locks()[slice_col], last);
-      }
-      if (last)
-        write_result();
-
-      slice_row = 0;
-      slice_col_par++;
-      slice_col++;
-      init_slice();
-      if (slice_iters) {
-        a_k_col = 0;      // slice_row is reset to 0 for new slice
-        b_k_row = 0;      // K rewinds to 0
-        b_n_col = b_sh_stride * slice_col;  // N advances to current slice
-        s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
-        start_pipes();
+      __syncthreads();
+      if (threadIdx.x / 32 < thread_n_blocks / 4) {
+        reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd + 0];
+        reinterpret_cast<int4*>(&frag_s)[1] = sh_s[s_sh_rd + 4];
       }
     }
+
+    // Inter-CTA global reduce (only when tile is split across CTAs)
+    // slice_idx=0 (highest K) goes first → no wait on initial lock=0
+    if (tile_work.is_splited()) {
+      marlin_cute::barrier_acquire(&cur_locks()[tile_work.n_idx], tile_work.slice_idx);
+      global_reduce(tile_work.is_first(), tile_work.is_last());
+      marlin_cute::barrier_release(&cur_locks()[tile_work.n_idx], tile_work.is_last());
+    }
+    if (tile_work.is_last())
+      write_result();
+
+    if (remaining_iters <= 0)
+      break;
+
+    // ---- Move to next tile ----
+    tile_idx++;
+    tile_work.init(k_tiles, n_tiles, iters_per_block, tile_idx, block_iter_begin, block_iter_end);
+    a_k_col = A_TILE_K_HALF * tile_work.k_iter_begin;
+    b_k_row = thread_k_blocks * tile_work.k_iter_begin;
+    b_n_col = b_sh_stride * tile_work.n_idx;
+    if constexpr (group_blocks != -1)
+      s_gl_rd = s_gl_stride * ((thread_k_blocks * tile_work.k_iter_begin) / group_blocks)
+              + s_sh_stride * tile_work.n_idx + threadIdx.x;
+    else
+      s_gl_rd = s_sh_stride * tile_work.n_idx + threadIdx.x;
+    start_pipes();
   }
 }
 
