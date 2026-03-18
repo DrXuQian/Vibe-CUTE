@@ -250,8 +250,7 @@ __global__ void MarlinCute(
   ));
 
   // --- A GMEM -> SMEM TiledCopy (Direction 1) ---
-  // ZFILL variant: zero-fills smem on OOB predicate (for M-bounds)
-  using GmemCopyAtomA = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>, cute::half_t>;
+  using GmemCopyAtomA = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, cute::half_t>;
   using GmemTiledCopyA = decltype(make_tiled_copy(
     GmemCopyAtomA{},
     Layout<Shape<Int<A_M_THREADS>, Int<A_TILE_K_INT4>>,
@@ -387,15 +386,15 @@ __global__ void MarlinCute(
         make_smem_ptr(reinterpret_cast<cute::half_t*>(sh_a + a_sh_stage * pipe)),
         SmemLayoutA{}
       );
-      // Partition source and destination
+      // Partition source, destination, and predicate via identity tensor
       auto tAgA = gmem_thr_copy_a.partition_S(gA_tile);
       auto tAsA = gmem_thr_copy_a.partition_D(sA_stage);
-      // M-bounds predication: use CuTe copy per-slice with if-guard
-      // ZFILL atom zero-fills smem when copy is skipped
-      int a_tid_m_local = threadIdx.x / A_TILE_K_INT4;
+      auto gA_identity = make_identity_tensor(shape(gA_tile));
+      auto tAgA_id = gmem_thr_copy_a.partition_S(gA_identity);
+      // M-bounds predication: CuTe identity tensor for coordinate lookup
       #pragma unroll
       for (int m = 0; m < size<1>(tAsA); m++) {
-        if ((a_tid_m_local + m * A_M_THREADS) < prob_m) {
+        if (get<0>(tAgA_id(_0{}, m, _0{})) < prob_m) {
           #pragma unroll
           for (int k = 0; k < size<2>(tAsA); k++)
             copy(gmem_tiled_copy_a, tAgA(_, m, k), tAsA(_, m, k));
