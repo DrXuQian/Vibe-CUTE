@@ -255,18 +255,10 @@ __global__ void MarlinCute(
   // CuTe Layout Definitions
   // ========================================================================
 
-  // --- A matrix: global and shared memory parameters ---
-  // Global: A is (prob_m, prob_k) in FP16, accessed as int4 (16B = 8 halfs)
-  //   a_gl_stride = prob_k / 8 (row stride in int4)
-  int a_gl_stride = prob_k / 8;
+  // --- A matrix parameters ---
+  int a_gl_stride = prob_k / 8;  // A row stride in int4 (= prob_k / 8)
   constexpr int a_sh_stride  = 16 * thread_k_blocks / 8;  // smem row stride in int4
-  constexpr int a_gl_rd_delta_o = 16 * thread_k_blocks / 8;
-  int a_gl_rd_delta_i = a_gl_stride * (threads / a_gl_rd_delta_o);
-  constexpr int a_sh_wr_delta = a_sh_stride * (threads / a_gl_rd_delta_o);
-  constexpr int a_sh_rd_delta_o = 2 * ((threads / 32) / (thread_n_blocks / 4));
-  constexpr int a_sh_rd_delta_i = a_sh_stride * 16;
-  constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks);
-  constexpr int a_sh_wr_iters = ceildiv_cute(a_sh_stage, a_sh_wr_delta);
+  constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks);  // smem int4 per stage
 
   // --- B matrix: global and shared memory parameters ---
   int b_gl_stride = 16 * prob_n / 32;
@@ -285,44 +277,48 @@ __global__ void MarlinCute(
   int s_gl_rd_delta = s_gl_stride;
 
   // ========================================================================
-  // CuTe Swizzled Layout for A Shared Memory
+  // CuTe Layouts and TiledCopy for A Matrix
   // ========================================================================
 
-  // The original swizzle: transform_a(i) = i ^ (i >> log2(a_sh_stride))
-  // CuTe equivalent: Swizzle<B, 0, B> where B = log2(a_sh_stride)
-  //   - CuTe requires abs(SShift) >= BBits, so B = shift
-  //   - For k_blocks=8 (stride=16): Swizzle<4, 0, 4> — XOR bits[0:3] with bits[4:7]
-  //   - For k_blocks=4 (stride=8):  Swizzle<3, 0, 3> — XOR bits[0:2] with bits[3:5]
-  //   - Sufficient for bank conflict avoidance; reads/writes use same layout
-  constexpr int A_TILE_M = 16 * thread_m_blocks;
-  constexpr int A_TILE_K = a_sh_stride;   // = 16 * thread_k_blocks / 8
-  constexpr int A_SH_BITS = (A_TILE_K == 16) ? 4 : 3;  // log2(a_sh_stride) = BBits = SShift
-  constexpr int A_M_THREADS = threads / A_TILE_K;  // threads per M dimension
+  // A tile dimensions (one pipeline stage)
+  constexpr int A_TILE_M = 16 * thread_m_blocks;         // rows in half_t
+  constexpr int A_TILE_K_HALF = 16 * thread_k_blocks;    // cols in half_t
+  constexpr int A_TILE_K_INT4 = a_sh_stride;             // cols in int4 (= A_TILE_K_HALF / 8)
+  constexpr int A_M_THREADS = threads / A_TILE_K_INT4;   // threads along M
+  constexpr int A_SH_BITS = (A_TILE_K_INT4 == 16) ? 4 : 3;  // log2(int4 stride)
 
-  // CuTe swizzled smem layout for one stage of A: (A_TILE_M, A_TILE_K) int4 elements
+  // --- A Shared Memory Layout (half_t, with Swizzle) ---
+  // Swizzle<B, 3, B> on half_t indices = Swizzle<B, 0, B> on int4 indices
+  // (3 low bits select within int4, swizzle operates on int4-granularity bits)
   using SmemLayoutA = decltype(composition(
-    Swizzle<A_SH_BITS, 0, A_SH_BITS>{},
-    make_layout(make_shape(Int<A_TILE_M>{}, Int<A_TILE_K>{}),
-                make_stride(Int<A_TILE_K>{}, Int<1>{}))
+    Swizzle<A_SH_BITS, 3, A_SH_BITS>{},
+    make_layout(make_shape(Int<A_TILE_M>{}, Int<A_TILE_K_HALF>{}),
+                make_stride(Int<A_TILE_K_HALF>{}, Int<1>{}))
   ));
+
+  // --- A GMEM -> SMEM TiledCopy (Direction 1) ---
+  // Copy atom: cp.async 16 bytes (= 8 half_t) per thread
+  // Thread layout: (A_M_THREADS, A_TILE_K_INT4), K-major
+  // Value layout: (1, 8) — 8 consecutive half_t along K per access
+  using GmemCopyAtomA = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, cute::half_t>;
+  using GmemTiledCopyA = decltype(make_tiled_copy(
+    GmemCopyAtomA{},
+    Layout<Shape<Int<A_M_THREADS>, Int<A_TILE_K_INT4>>,
+           Stride<Int<A_TILE_K_INT4>, _1>>{},
+    Layout<Shape<_1, _8>>{}
+  ));
+
+  // --- A SMEM -> Reg ---
+  // Uses manual ldsm4 (ldmatrix.sync.aligned.m8n8.x4) with CuTe SmemLayoutA
+  // for swizzled address computation. The CuTe layout handles the XOR swizzle
+  // automatically when we access sA_stage(row, col).
 
   // ========================================================================
   // Per-Thread Index Computation
   // ========================================================================
 
-  // A matrix: per-thread 2D coordinates for gmem->smem copy
-  int a_tid_m = threadIdx.x / A_TILE_K;   // thread's row assignment
-  int a_tid_k = threadIdx.x % A_TILE_K;   // thread's col assignment
-
-  // A matrix: global read base offset (flat, for the K dimension)
-  int a_gl_rd = a_gl_stride * a_tid_m + a_tid_k;
-  a_gl_rd += a_gl_rd_delta_o * slice_row;
-
-  // A matrix: shared memory read coordinates (for ldmatrix)
-  // Each warp reads a 16x16 block; lane determines row, lane/16 gives col offset
-  int a_rd_row_base = (threadIdx.x % 32) % 16;
-  int a_rd_col_base = (threadIdx.x % 32) / 16
-                    + 2 * ((threadIdx.x / 32) / (thread_n_blocks / 4));
+  // A matrix: K-column base offset for pipeline (replaces a_gl_rd)
+  int a_k_col = A_TILE_K_HALF * slice_row;  // in half_t units
 
   // B matrix indices
   int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride) + (threadIdx.x % b_sh_stride);
@@ -341,15 +337,18 @@ __global__ void MarlinCute(
     s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) % 4;
 
   // ========================================================================
-  // Predication
+  // Predication & CuTe Partition Setup for A
   // ========================================================================
 
-  // A write predicate: check if this thread's row is within prob_m
-  bool a_sh_wr_pred[a_sh_wr_iters];
-  #pragma unroll
-  for (int i = 0; i < a_sh_wr_iters; i++)
-    a_sh_wr_pred[i] = a_tid_m + i * A_M_THREADS < prob_m;
   bool s_sh_wr_pred = threadIdx.x < s_sh_stride;
+
+  // --- CuTe: instantiate TiledCopy and TiledMMA, get thread slices ---
+  GmemTiledCopyA gmem_tiled_copy_a;
+  auto gmem_thr_copy_a = gmem_tiled_copy_a.get_thread_slice(threadIdx.x);
+
+  // Precompute A gmem->smem predicate
+  // Thread tid maps to row = tid / A_TILE_K_INT4 for each M-iteration
+  int a_tid_m = threadIdx.x / A_TILE_K_INT4;
 
   // ========================================================================
   // B pointers (multiple to break dependency chains)
@@ -394,20 +393,26 @@ __global__ void MarlinCute(
 
   auto fetch_to_shared = [&] (int pipe, int a_off, bool pred = true) {
     if (pred) {
-      // --- A matrix: GMEM -> SMEM via cp.async ---
-      // Use CuTe SmemLayoutA (with Swizzle) to compute destination addresses
+      // --- A matrix: GMEM -> SMEM via CuTe TiledCopy ---
+      // Create gmem tensor for this K-tile (half_t elements)
+      auto gA_tile = make_tensor(
+        make_gmem_ptr(reinterpret_cast<const cute::half_t*>(A) + a_k_col + A_TILE_K_HALF * a_off),
+        make_shape(Int<A_TILE_M>{}, Int<A_TILE_K_HALF>{}),
+        make_stride(prob_k, Int<1>{})
+      );
+      // Create smem tensor for this stage (half_t with swizzle)
       auto sA_stage = make_tensor(
-        make_smem_ptr(sh_a + a_sh_stage * pipe),
+        make_smem_ptr(reinterpret_cast<cute::half_t*>(sh_a + a_sh_stage * pipe)),
         SmemLayoutA{}
       );
+      // Partition source and destination for this thread
+      auto tAgA = gmem_thr_copy_a.partition_S(gA_tile);  // (CPY, CPY_M, CPY_K)
+      auto tAsA = gmem_thr_copy_a.partition_D(sA_stage); // (CPY, CPY_M, CPY_K)
+      // Copy with predication (iterate over M-partitions)
       #pragma unroll
-      for (int i = 0; i < a_sh_wr_iters; i++) {
-        int row = a_tid_m + i * A_M_THREADS;
-        cp_async4_pred_cute(
-          &sA_stage(row, a_tid_k),
-          &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
-          a_sh_wr_pred[i]
-        );
+      for (int i = 0; i < size<1>(tAsA); i++) {
+        bool m_pred = (a_tid_m + i * A_M_THREADS) < prob_m;
+        cp_async4_pred_cute(&tAsA(_0{}, i, _0{}), &tAgA(_0{}, i, _0{}), m_pred);
       }
 
       // --- B matrix: GMEM -> SMEM via cp.async (evict-first) ---
@@ -454,15 +459,30 @@ __global__ void MarlinCute(
     }
 
     // A: ldmatrix from CuTe-swizzled shared memory
-    auto sA_stage = make_tensor(
-      make_smem_ptr(sh_a + a_sh_stage * pipe),
-      SmemLayoutA{}
-    );
-    #pragma unroll
-    for (int i = 0; i < thread_m_blocks; i++) {
-      int a_rd_row = a_rd_row_base + i * 16;
-      int a_rd_col = a_rd_col_base + a_sh_rd_delta_o * (k % b_sh_wr_iters);
-      ldsm4_cute(frag_a[k % 2][i], &sA_stage(a_rd_row, a_rd_col));
+    // Uses manual ldsm4 with CuTe SmemLayoutA for swizzled address computation.
+    // Full CuTe ldmatrix atom (SM75_U32x4_LDSM_N) requires retile support for
+    // MMA-compatible layouts, which would be a larger refactor.
+    {
+      auto sA_stage = make_tensor(
+        make_smem_ptr(reinterpret_cast<cute::half_t*>(sh_a + a_sh_stage * pipe)),
+        SmemLayoutA{}
+      );
+      // Compute 2D smem read coordinates for ldmatrix
+      // lane_id % 16 = row within 16x16 block (for m8n8.x4)
+      // lane_id / 16 + 2 * k_warp_id = column offset (in int4 units, *8 for half_t)
+      constexpr int a_sh_rd_delta_o = 2 * ((threads / 32) / (thread_n_blocks / 4));
+      int lane_id = threadIdx.x % 32;
+      int warp_id = threadIdx.x / 32;
+      int k_warp_id = warp_id / (thread_n_blocks / 4);
+      int a_rd_row_base = lane_id % 16;
+      int a_rd_col_base = (lane_id / 16 + 2 * k_warp_id) * 8;  // *8: int4 -> half_t
+      int k_subtile = k % b_sh_wr_iters;
+      #pragma unroll
+      for (int i = 0; i < thread_m_blocks; i++) {
+        int a_rd_row = a_rd_row_base + i * 16;
+        int a_rd_col = a_rd_col_base + a_sh_rd_delta_o * k_subtile * 8;
+        ldsm4_cute(frag_a[k % 2][i], &sA_stage(a_rd_row, a_rd_col));
+      }
     }
 
     // B: direct load of packed INT4 from shared memory
@@ -665,7 +685,7 @@ __global__ void MarlinCute(
       fetch_to_shared(i, i, i < slice_iters);
     wait_for_stage();
     fetch_to_registers(0, 0);
-    a_gl_rd += a_gl_rd_delta_o * (stages - 1);
+    a_k_col += A_TILE_K_HALF * (stages - 1);
   };
   start_pipes();
 
@@ -690,7 +710,7 @@ __global__ void MarlinCute(
       if (slice_iters == 0)
         break;
     }
-    a_gl_rd += a_gl_rd_delta_o * stages;
+    a_k_col += A_TILE_K_HALF * stages;
 
     // Post-processing: reduce and possibly move to next column slice
     if (slice_iters == 0) {
@@ -728,7 +748,7 @@ __global__ void MarlinCute(
       slice_col++;
       init_slice();
       if (slice_iters) {
-        a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+        a_k_col = 0;  // slice_row is reset to 0 for new slice
         #pragma unroll
         for (int i = 0; i < b_sh_wr_iters; i++)
           B_ptr[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
