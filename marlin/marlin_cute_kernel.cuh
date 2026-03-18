@@ -336,10 +336,16 @@ __global__ void MarlinCute(
     Layout<Shape<_1, _1>>{}
   ));
 
-  // --- A SMEM -> Reg ---
-  // Uses manual ldsm4 (ldmatrix.sync.aligned.m8n8.x4) with CuTe SmemLayoutA
-  // for swizzled address computation. The CuTe layout handles the XOR swizzle
-  // automatically when we access sA_stage(row, col).
+  // --- A SMEM -> Reg via TiledMMA partition (Direction 2 / Step 6.2) ---
+  // Use TiledMMA to partition smem A and create register fragments.
+  // copy(tCsA, tCrA) produces identical register layout to ldmatrix.
+  // Warp layout: (1 on M, N_WARPS_N on N, N_WARPS_K on K)
+  constexpr int N_WARPS_N = thread_n_blocks / 4;
+  constexpr int N_WARPS_K = (threads / 32) / N_WARPS_N;
+  using TiledMma = TiledMMA<
+    MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
+    Layout<Shape<_1, Int<N_WARPS_N>, Int<N_WARPS_K>>>
+  >;
 
   // ========================================================================
   // Per-Thread Index Computation
@@ -374,6 +380,10 @@ __global__ void MarlinCute(
 
   GmemTiledCopyB gmem_tiled_copy_b;
   auto gmem_thr_copy_b = gmem_tiled_copy_b.get_thread_slice(threadIdx.x);
+
+  // TiledMMA for A smem->reg partitioning
+  TiledMma tiled_mma;
+  auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
 
   // Precompute A gmem->smem predicate
   // Thread tid maps to row = tid / A_TILE_K_INT4 for each M-iteration
@@ -491,30 +501,28 @@ __global__ void MarlinCute(
       reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
     }
 
-    // A: ldmatrix from CuTe-swizzled shared memory
-    // Uses manual ldsm4 with CuTe SmemLayoutA for swizzled address computation.
-    // Full CuTe ldmatrix atom (SM75_U32x4_LDSM_N) requires retile support for
-    // MMA-compatible layouts, which would be a larger refactor.
+    // A: smem -> reg via CuTe TiledMMA partition
+    // partition_A gives MMA-compatible smem view, partition_fragment_A gives
+    // matching register tensor. copy() auto-vectorizes the transfer.
     {
       auto sA_stage = make_tensor(
         make_smem_ptr(reinterpret_cast<cute::half_t*>(sh_a + a_sh_stage * pipe)),
         SmemLayoutA{}
       );
-      // Compute 2D smem read coordinates for ldmatrix
-      // lane_id % 16 = row within 16x16 block (for m8n8.x4)
-      // lane_id / 16 + 2 * k_warp_id = column offset (in int4 units, *8 for half_t)
-      constexpr int a_sh_rd_delta_o = 2 * ((threads / 32) / (thread_n_blocks / 4));
-      int lane_id = threadIdx.x % 32;
-      int warp_id = threadIdx.x / 32;
-      int k_warp_id = warp_id / (thread_n_blocks / 4);
-      int a_rd_row_base = lane_id % 16;
-      int a_rd_col_base = (lane_id / 16 + 2 * k_warp_id) * 8;  // *8: int4 -> half_t
+      auto tCsA = thr_mma.partition_A(sA_stage);           // (MMA=8, MMA_M, MMA_K)
+
+      // Create register fragment backed by frag_a storage
+      // partition_fragment_A shape: (MMA=8, MMA_M=m_blocks, MMA_K=b_sh_wr_iters)
+      // Each (MMA=8) slice = 8 half_t = 4 half2 = 1 FragA
       int k_subtile = k % b_sh_wr_iters;
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
-        int a_rd_row = a_rd_row_base + i * 16;
-        int a_rd_col = a_rd_col_base + a_sh_rd_delta_o * k_subtile * 8;
-        ldsm4_cute(frag_a[k % 2][i], &sA_stage(a_rd_row, a_rd_col));
+        // Create a register tensor view over frag_a[k%2][i] (8 half_t = 1 FragA)
+        auto tCrA_i = make_tensor(
+          make_rmem_ptr(reinterpret_cast<cute::half_t*>(&frag_a[k % 2][i])),
+          shape(tCsA(_, _0{}, _0{}))  // same shape as MMA mode: (MMA=8)
+        );
+        copy(tCsA(_, i, k_subtile), tCrA_i);
       }
     }
 
