@@ -260,15 +260,12 @@ __global__ void MarlinCute(
   constexpr int a_sh_stride  = 16 * thread_k_blocks / 8;  // smem row stride in int4
   constexpr int a_sh_stage = a_sh_stride * (16 * thread_m_blocks);  // smem int4 per stage
 
-  // --- B matrix: global and shared memory parameters ---
-  int b_gl_stride = 16 * prob_n / 32;
-  constexpr int b_sh_stride  = 32 * thread_n_blocks / 4;
-  int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks;
-  int b_gl_rd_delta_i = b_gl_stride * (threads / b_sh_stride);
-  constexpr int b_sh_wr_delta = threads;
+  // --- B matrix parameters ---
+  int b_gl_stride = 16 * prob_n / 32;  // B row stride in int4
+  constexpr int b_sh_stride  = 32 * thread_n_blocks / 4;  // smem N-dimension in int4
   constexpr int b_sh_rd_delta = threads;
   constexpr int b_sh_stage = b_sh_stride * thread_k_blocks;
-  constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
+  constexpr int b_sh_wr_iters = b_sh_stage / threads;
 
   // --- Scale matrix parameters ---
   int s_gl_stride = prob_n / 8;
@@ -308,6 +305,31 @@ __global__ void MarlinCute(
     Layout<Shape<_1, _8>>{}
   ));
 
+  // ========================================================================
+  // CuTe TiledCopy for B Matrix (Direction 3)
+  // ========================================================================
+
+  // B tile dimensions (one pipeline stage)
+  // B layout: (K/16, N*16/32) in int4, no swizzle (offline reordered)
+  constexpr int B_TILE_K = thread_k_blocks;
+  constexpr int B_TILE_N = b_sh_stride;            // = 8 * thread_n_blocks
+  constexpr int B_K_THREADS = threads / B_TILE_N;  // threads along K dim
+
+  // B smem layout: flat, no swizzle (data is offline reordered)
+  using SmemLayoutB = decltype(make_layout(
+    make_shape(Int<B_TILE_K>{}, Int<B_TILE_N>{}),
+    make_stride(Int<B_TILE_N>{}, _1{})
+  ));
+
+  // B GMEM -> SMEM TiledCopy (cp.async.cg for L2-only caching)
+  using GmemCopyAtomB = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, int4>;
+  using GmemTiledCopyB = decltype(make_tiled_copy(
+    GmemCopyAtomB{},
+    Layout<Shape<Int<B_K_THREADS>, Int<B_TILE_N>>,
+           Stride<Int<B_TILE_N>, _1>>{},
+    Layout<Shape<_1, _1>>{}
+  ));
+
   // --- A SMEM -> Reg ---
   // Uses manual ldsm4 (ldmatrix.sync.aligned.m8n8.x4) with CuTe SmemLayoutA
   // for swizzled address computation. The CuTe layout handles the XOR swizzle
@@ -320,12 +342,10 @@ __global__ void MarlinCute(
   // A matrix: K-column base offset for pipeline (replaces a_gl_rd)
   int a_k_col = A_TILE_K_HALF * slice_row;  // in half_t units
 
-  // B matrix indices
-  int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride) + (threadIdx.x % b_sh_stride);
-  b_gl_rd += b_sh_stride * slice_col;
-  b_gl_rd += b_gl_rd_delta_o * slice_row;
-  int b_sh_wr = threadIdx.x;
-  int b_sh_rd = threadIdx.x;
+  // B matrix: tracked via 2D offsets (replaces B_ptr[] and b_gl_rd)
+  int b_k_row = thread_k_blocks * slice_row;  // current K-row offset in B's global layout
+  int b_n_col = b_sh_stride * slice_col;       // current N-col offset
+  int b_sh_rd = threadIdx.x;                   // smem read index (flat, identity mapping)
 
   // Scale indices
   int s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + s_sh_stride * slice_col + threadIdx.x;
@@ -346,18 +366,12 @@ __global__ void MarlinCute(
   GmemTiledCopyA gmem_tiled_copy_a;
   auto gmem_thr_copy_a = gmem_tiled_copy_a.get_thread_slice(threadIdx.x);
 
+  GmemTiledCopyB gmem_tiled_copy_b;
+  auto gmem_thr_copy_b = gmem_tiled_copy_b.get_thread_slice(threadIdx.x);
+
   // Precompute A gmem->smem predicate
   // Thread tid maps to row = tid / A_TILE_K_INT4 for each M-iteration
   int a_tid_m = threadIdx.x / A_TILE_K_INT4;
-
-  // ========================================================================
-  // B pointers (multiple to break dependency chains)
-  // ========================================================================
-
-  const int4* B_ptr[b_sh_wr_iters];
-  #pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; i++)
-    B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
 
   // ========================================================================
   // Shared Memory Allocation
@@ -415,12 +429,25 @@ __global__ void MarlinCute(
         cp_async4_pred_cute(&tAsA(_0{}, i, _0{}), &tAgA(_0{}, i, _0{}), m_pred);
       }
 
-      // --- B matrix: GMEM -> SMEM via cp.async (evict-first) ---
-      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
-      #pragma unroll
-      for (int i = 0; i < b_sh_wr_iters; i++) {
-        cp_async4_stream_cute(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr], B_ptr[i]);
-        B_ptr[i] += b_gl_rd_delta_o;
+      // --- B matrix: GMEM -> SMEM via CuTe TiledCopy ---
+      {
+        auto gB_tile = make_tensor(
+          make_gmem_ptr(B + b_gl_stride * b_k_row + b_n_col),
+          make_shape(Int<B_TILE_K>{}, Int<B_TILE_N>{}),
+          make_stride(b_gl_stride, Int<1>{})
+        );
+        auto sB_stage = make_tensor(
+          make_smem_ptr(sh_b + b_sh_stage * pipe),
+          SmemLayoutB{}
+        );
+        auto tBgB = gmem_thr_copy_b.partition_S(gB_tile);
+        auto tBsB = gmem_thr_copy_b.partition_D(sB_stage);
+        // No predication needed for B (tile always fully valid)
+        #pragma unroll
+        for (int i = 0; i < size<1>(tBsB); i++) {
+          cp_async4_stream_cute(&tBsB(_0{}, i, _0{}), &tBgB(_0{}, i, _0{}));
+        }
+        b_k_row += thread_k_blocks;  // advance to next K-tile
       }
 
       // --- Scales: fetch once per quantization group ---
@@ -748,15 +775,9 @@ __global__ void MarlinCute(
       slice_col++;
       init_slice();
       if (slice_iters) {
-        a_k_col = 0;  // slice_row is reset to 0 for new slice
-        #pragma unroll
-        for (int i = 0; i < b_sh_wr_iters; i++)
-          B_ptr[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
-        if (slice_col == 0) {
-          #pragma unroll
-          for (int i = 0; i < b_sh_wr_iters; i++)
-            B_ptr[i] -= b_gl_stride;
-        }
+        a_k_col = 0;      // slice_row is reset to 0 for new slice
+        b_k_row = 0;      // K rewinds to 0
+        b_n_col = b_sh_stride * slice_col;  // N advances to current slice
         s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
         start_pipes();
       }
