@@ -59,8 +59,10 @@ __device__ inline int lop3(int a, int b, int c) {
   return res;
 }
 
-// INT4 dequantization: int32 -> 4x FP16 (FragB)
-__device__ inline FragB dequant_4bit(int q) {
+// INT4 dequantization: int32 -> CuTe tensor of 2x half2 (= 4x FP16)
+__device__ inline auto dequant_4bit(int q) {
+  using namespace cute;
+  auto frag = make_tensor<half2>(make_shape(_2{}));
   const int LO = 0x000f000f;
   const int HI = 0x00f000f0;
   const int EX = 0x64006400;
@@ -69,23 +71,23 @@ __device__ inline FragB dequant_4bit(int q) {
   const int SUB = 0x64086408;
   const int MUL = 0x2c002c00;
   const int ADD = 0xd480d480;
-  FragB frag_b;
-  frag_b[0] = __hsub2(
+  frag(0) = __hsub2(
     *reinterpret_cast<half2*>(&lo),
     *reinterpret_cast<const half2*>(&SUB)
   );
-  frag_b[1] = __hfma2(
+  frag(1) = __hfma2(
     *reinterpret_cast<half2*>(&hi),
     *reinterpret_cast<const half2*>(&MUL), *reinterpret_cast<const half2*>(&ADD)
   );
-  return frag_b;
+  return frag;
 }
 
-// Scale a B fragment by quantization scale
-__device__ inline void scale_frag(FragB& frag_b, FragS& frag_s, int i) {
+// Scale a dequantized B fragment (CuTe tensor<half2, (_2,)>)
+template <class FragTensor>
+__device__ inline void scale_frag(FragTensor& frag, FragS& frag_s, int i) {
   half2 s = __half2half2(reinterpret_cast<__half*>(&frag_s)[i]);
-  frag_b[0] = __hmul2(frag_b[0], s);
-  frag_b[1] = __hmul2(frag_b[1], s);
+  frag(0) = __hmul2(frag(0), s);
+  frag(1) = __hmul2(frag(1), s);
 }
 
 // Cross-CTA synchronization barriers (Marlin-specific)
@@ -248,10 +250,8 @@ __global__ void MarlinCute(
   ));
 
   // --- A GMEM -> SMEM TiledCopy (Direction 1) ---
-  // Copy atom: cp.async 16 bytes (= 8 half_t) per thread
-  // Thread layout: (A_M_THREADS, A_TILE_K_INT4), K-major
-  // Value layout: (1, 8) — 8 consecutive half_t along K per access
-  using GmemCopyAtomA = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, cute::half_t>;
+  // ZFILL variant: zero-fills smem on OOB predicate (for M-bounds)
+  using GmemCopyAtomA = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>, cute::half_t>;
   using GmemTiledCopyA = decltype(make_tiled_copy(
     GmemCopyAtomA{},
     Layout<Shape<Int<A_M_THREADS>, Int<A_TILE_K_INT4>>,
@@ -335,9 +335,6 @@ __global__ void MarlinCute(
   auto smem_tiled_copy_a = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
   auto smem_thr_copy_a = smem_tiled_copy_a.get_thread_slice(threadIdx.x);
 
-  // Precompute A gmem->smem predicate
-  // Thread tid maps to row = tid / A_TILE_K_INT4 for each M-iteration
-  int a_tid_m = threadIdx.x / A_TILE_K_INT4;
 
   // ========================================================================
   // Shared Memory Allocation
@@ -390,13 +387,15 @@ __global__ void MarlinCute(
         make_smem_ptr(reinterpret_cast<cute::half_t*>(sh_a + a_sh_stage * pipe)),
         SmemLayoutA{}
       );
-      // Partition source and destination for this thread
-      auto tAgA = gmem_thr_copy_a.partition_S(gA_tile);  // (CPY, CPY_M, CPY_K)
-      auto tAsA = gmem_thr_copy_a.partition_D(sA_stage); // (CPY, CPY_M, CPY_K)
-      // Copy with M-bounds predication via CuTe copy
+      // Partition source and destination
+      auto tAgA = gmem_thr_copy_a.partition_S(gA_tile);
+      auto tAsA = gmem_thr_copy_a.partition_D(sA_stage);
+      // M-bounds predication: use CuTe copy per-slice with if-guard
+      // ZFILL atom zero-fills smem when copy is skipped
+      int a_tid_m_local = threadIdx.x / A_TILE_K_INT4;
       #pragma unroll
       for (int m = 0; m < size<1>(tAsA); m++) {
-        if ((a_tid_m + m * A_M_THREADS) < prob_m) {
+        if ((a_tid_m_local + m * A_M_THREADS) < prob_m) {
           #pragma unroll
           for (int k = 0; k < size<2>(tAsA); k++)
             copy(gmem_tiled_copy_a, tAgA(_, m, k), tAsA(_, m, k));
@@ -483,37 +482,34 @@ __global__ void MarlinCute(
   //   Uses m16n8k16 MMA atom. Dequant is interleaved with MMA to hide latency.
   // ========================================================================
 
+  // MMA atom for direct gemm() calls
+  using MmaOp = cute::SM80_16x8x16_F32F16F16F32_TN;
+  MMA_Atom<MmaOp> mma_atom;
+
   auto matmul = [&] (int k) {
     auto& tCrA = (k % 2 == 0) ? tCrA_buf0 : tCrA_buf1;
     int k_subtile = k % b_sh_wr_iters;
     #pragma unroll
     for (int j = 0; j < 4; j++) {
-      // Dequantize INT4 -> FP16
+      // Dequantize INT4 -> CuTe tensor<half2, (_2,)>
       int b_quant = frag_b_quant[k % 2][j];
-      int b_quant_shift = b_quant >> 8;
-      FragB frag_b0 = marlin_cute::dequant_4bit(b_quant);
-      if (group_blocks != -1)
-        marlin_cute::scale_frag(frag_b0, frag_s[k % 2][j], 0);
-      FragB frag_b1 = marlin_cute::dequant_4bit(b_quant_shift);
-      if (group_blocks != -1)
-        marlin_cute::scale_frag(frag_b1, frag_s[k % 2][j], 1);
+      auto dq_b0 = marlin_cute::dequant_4bit(b_quant);
+      auto dq_b1 = marlin_cute::dequant_4bit(b_quant >> 8);
+      if (group_blocks != -1) {
+        marlin_cute::scale_frag(dq_b0, frag_s[k % 2][j], 0);
+        marlin_cute::scale_frag(dq_b1, frag_s[k % 2][j], 1);
+      }
+      // recast half2 -> half_t for MMA B operand (4 half_t = 2 uint32)
+      auto b0 = recast<cute::half_t>(dq_b0);
+      auto b1 = recast<cute::half_t>(dq_b1);
 
-      // MMA: iterate over M blocks, using CuTe A fragments + SM80 fma
+      // MMA via CuTe gemm: C += A * B
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
-        const uint32_t* a = reinterpret_cast<const uint32_t*>(&tCrA(0, i, k_subtile));
-        const uint32_t* b0 = reinterpret_cast<const uint32_t*>(&frag_b0);
-        const uint32_t* b1 = reinterpret_cast<const uint32_t*>(&frag_b1);
-        float* c0 = frag_c[i][j][0].elems;
-        float* c1 = frag_c[i][j][1].elems;
-        cute::SM80_16x8x16_F32F16F16F32_TN::fma(
-          c0[0], c0[1], c0[2], c0[3],
-          a[0], a[1], a[2], a[3],  b0[0], b0[1],
-          c0[0], c0[1], c0[2], c0[3]);
-        cute::SM80_16x8x16_F32F16F16F32_TN::fma(
-          c1[0], c1[1], c1[2], c1[3],
-          a[0], a[1], a[2], a[3],  b1[0], b1[1],
-          c1[0], c1[1], c1[2], c1[3]);
+        auto c0 = make_tensor(make_rmem_ptr(frag_c[i][j][0].elems), Shape<_4>{});
+        auto c1 = make_tensor(make_rmem_ptr(frag_c[i][j][1].elems), Shape<_4>{});
+        gemm(mma_atom, tCrA(_, i, k_subtile), b0, c0);
+        gemm(mma_atom, tCrA(_, i, k_subtile), b1, c1);
       }
     }
   };
