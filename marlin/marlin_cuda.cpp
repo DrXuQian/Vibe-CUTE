@@ -38,6 +38,46 @@ int marlin_cuda(
   int max_par = 16
 );
 
+int marlin_cuda_huffman(
+  const void* A,
+  const void* bitstream,
+        void* C,
+        void* s,
+  const void* huffman_lut,
+  const void* tile_byte_offsets,
+  const void* tile_gaps,
+  int max_stage_comp_bytes,
+  int prob_m,
+  int prob_n,
+  int prob_k,
+  void* workspace,
+  int groupsize = -1,
+  int dev = 0,
+  cudaStream_t stream = 0,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int max_par = 16
+);
+
+int marlin_cuda_cute(
+  const void* A,
+  const void* B,
+        void* C,
+        void* s,
+  int prob_m,
+  int prob_n,
+  int prob_k,
+  void* workspace,
+  int groupsize = -1,
+  int dev = 0,
+  cudaStream_t stream = 0,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int max_par = 16
+);
+
 const int ERR_PROB_SHAPE = 1;
 const int ERR_KERN_SHAPE = 2;
 
@@ -88,6 +128,119 @@ void mul(
   }
 }
 
+void mul_huffman(
+  const torch::Tensor& A,
+  const torch::Tensor& bitstream,
+        torch::Tensor& C,
+  const torch::Tensor& s,
+  const torch::Tensor& huffman_lut,
+  const torch::Tensor& tile_byte_offsets,
+  const torch::Tensor& tile_gaps,
+  int max_stage_comp_bytes,
+        torch::Tensor& workspace,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int max_par = 8
+) {
+  int prob_m = A.size(0);
+  int prob_n = C.size(1);
+  int prob_k = A.size(1);
+  int groupsize = (s.size(0) == 1) ? -1 : prob_k / s.size(0);
+  if (groupsize != -1)
+    AT_ERROR("Huffman fused Marlin currently supports only per-column scales.");
+  if (workspace.numel() < prob_n / 128 * max_par)
+    AT_ERROR("workspace must be of size at least ", prob_n / 128 * max_par, ".");
+  if (bitstream.scalar_type() != torch::kUInt8)
+    AT_ERROR("bitstream must have dtype uint8.");
+  if (huffman_lut.scalar_type() != torch::kUInt8 || huffman_lut.numel() != 128)
+    AT_ERROR("huffman_lut must have dtype uint8 and 128 entries.");
+  if (tile_byte_offsets.scalar_type() != torch::kInt32)
+    AT_ERROR("tile_byte_offsets must have dtype int32.");
+  if (tile_gaps.scalar_type() != torch::kUInt16)
+    AT_ERROR("tile_gaps must have dtype uint16.");
+
+  int dev = A.get_device();
+  int err = marlin_cuda_huffman(
+    A.data_ptr(),
+    bitstream.data_ptr(),
+    C.data_ptr(),
+    s.data_ptr(),
+    huffman_lut.data_ptr(),
+    tile_byte_offsets.data_ptr(),
+    tile_gaps.data_ptr(),
+    max_stage_comp_bytes,
+    prob_m, prob_n, prob_k,
+    workspace.data_ptr(),
+    groupsize,
+    dev,
+    at::cuda::getCurrentCUDAStream(dev),
+    thread_k,
+    thread_n,
+    sms,
+    max_par
+  );
+  if (err == ERR_PROB_SHAPE) {
+    AT_ERROR(
+      "Problem (m=", prob_m, ", n=", prob_n, ", k=", prob_k, ")",
+      " not compatible with thread_k=", thread_k, ", thread_n=", thread_n, "."
+    );
+  } else if (err == ERR_KERN_SHAPE) {
+    AT_ERROR(
+      "No Huffman kernel implementation for thread_k=", thread_k, ", thread_n=", thread_n, "."
+    );
+  }
+}
+
+void mul_cute(
+  const torch::Tensor& A,
+  const torch::Tensor& B,
+        torch::Tensor& C,
+  const torch::Tensor& s,
+        torch::Tensor& workspace,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int max_par = 8
+) {
+  int prob_m = A.size(0);
+  int prob_n = C.size(1);
+  int prob_k = A.size(1);
+  int groupsize = (s.size(0) == 1) ? -1 : prob_k / s.size(0);
+  if (groupsize != -1 && groupsize * s.size(0) != prob_k)
+    AT_ERROR("k=", prob_k, " not compatible with ", s.size(0), " groups.");
+  if (workspace.numel() < prob_n / 128 * max_par)
+    AT_ERROR("workspace must be of size at least ", prob_n / 128 * max_par, ".");
+  int dev = A.get_device();
+  int err = marlin_cuda_cute(
+    A.data_ptr(),
+    B.data_ptr(),
+    C.data_ptr(),
+    s.data_ptr(),
+    prob_m, prob_n, prob_k,
+    workspace.data_ptr(),
+    groupsize,
+    dev,
+    at::cuda::getCurrentCUDAStream(dev),
+    thread_k,
+    thread_n,
+    sms,
+    max_par
+  );
+  if (err == ERR_PROB_SHAPE) {
+    AT_ERROR(
+      "Problem (m=", prob_m, ", n=", prob_n, ", k=", prob_k, ")",
+      " not compatible with thread_k=", thread_k, ", thread_n=", thread_n, "."
+    );
+  } else if (err == ERR_KERN_SHAPE) {
+    AT_ERROR(
+      "No CuTe kernel implementation for thread_k=", thread_k, ", thread_n=", thread_n, ", groupsize=", groupsize, "."
+    );
+  }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mul", &mul, "Marlin FP16xINT4 matmul.");
+  m.def("mul_cute", &mul_cute, "Marlin FP16xINT4 matmul (CuTe version).");
+  m.def("mul_huffman", &mul_huffman, "Marlin FP16xINT4 matmul with fused Huffman decode.");
 }

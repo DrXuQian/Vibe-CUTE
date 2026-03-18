@@ -34,6 +34,59 @@ def mul(A, B, C, s, workspace, thread_k=-1, thread_n=-1, sms=-1, max_par=16):
     """
     marlin_cuda.mul(A, B, C, s, workspace, thread_k, thread_n, sms, max_par)
 
+def mul_cute(A, B, C, s, workspace, thread_k=-1, thread_n=-1, sms=-1, max_par=16):
+    """Marlin FP16xINT4 multiply using CuTe-based kernel. Same interface as mul().
+    @A: `torch.half` input matrix of shape `(m, k)` in standard row-major layout
+    @B: `torch.int` weight matrix of original shape `(k, n)` in Marlin format; see `Layer.pack()`
+    @C: `torch.half` out matrix of shape `(m, n)` in standard row-major layout
+    @s: `torch.half` scales of shape `(m / groupsize, n)`
+    @workspace: `torch.int` tensor with at least `n / 128 * max_par` entries that are all zero
+    """
+    marlin_cuda.mul_cute(A, B, C, s, workspace, thread_k, thread_n, sms, max_par)
+
+
+def mul_huffman(
+    A,
+    bitstream,
+    C,
+    s,
+    huffman_lut,
+    tile_byte_offsets,
+    tile_gaps,
+    max_stage_comp_bytes,
+    workspace,
+    thread_k=-1,
+    thread_n=-1,
+    sms=-1,
+    max_par=16,
+):
+    """Marlin FP16xINT4 multiply with fused Huffman decode of packed B stages.
+    @A: `torch.half` input matrix of shape `(m, k)` in standard row-major layout
+    @bitstream: `torch.uint8` Huffman-compressed stage-major weight stream
+    @C: `torch.half` out matrix of shape `(m, n)` in standard row-major layout
+    @s: `torch.half` scales of shape `(1, n)` for per-column quantization
+    @huffman_lut: `torch.uint8` decode LUT of shape `(128,)`
+    @tile_byte_offsets: `torch.int32` per-tile byte offsets with a sentinel entry, shape `(num_tiles + 1,)`
+    @tile_gaps: `torch.uint16` per-tile, per-thread start bit offsets, shape `(num_tiles * 128,)`
+    @max_stage_comp_bytes: maximum compressed byte count of a single Marlin B stage
+    @workspace: `torch.int` tensor with at least `n / 128 * max_par` entries that are all zero
+    """
+    marlin_cuda.mul_huffman(
+        A,
+        bitstream,
+        C,
+        s,
+        huffman_lut,
+        tile_byte_offsets,
+        tile_gaps,
+        max_stage_comp_bytes,
+        workspace,
+        thread_k,
+        thread_n,
+        sms,
+        max_par,
+    )
+
 
 # Precompute permutations for Marlin weight and scale shuffling 
 

@@ -71,9 +71,7 @@ __device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
     "{\n"
-    "   .reg .b64 p;\n"
-    "   createpolicy.fractional.L2::evict_first.b64 p, 1.0;"
-    "   cp.async.cg.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
+    "   cp.async.cg.shared.global [%0], [%1], %2;\n"
     "}\n" :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
   );
 }
@@ -185,6 +183,59 @@ __device__ inline void barrier_release(int* lock, bool reset = false) {
   }
 }
 
+constexpr int HUFFMAN_MAX_CODE_LEN = 7;
+constexpr int HUFFMAN_THREADS_PER_TILE = 128;
+constexpr int HUFFMAN_SYMBOLS_PER_THREAD = 8;
+constexpr int HUFFMAN_TILE_OUTPUT_BYTES = HUFFMAN_THREADS_PER_TILE * (HUFFMAN_SYMBOLS_PER_THREAD / 2);
+constexpr int HUFFMAN_SUBTILES_PER_STAGE = 16;
+constexpr int HUFFMAN_TILE_ALIGN_BYTES = 16;
+constexpr int HUFFMAN_BITSTREAM_TRAILER_BYTES = 8;
+
+// LUT lookup via warp register shuffle.
+// Each warp (32 threads) collectively holds all 128 LUT bytes in one uint32 per thread
+// (4 bytes per thread × 32 threads = 128 bytes).  __shfl_sync latency ~4-6 cycles
+// vs shared memory ~22 cycles, which cuts the serial decode chain cost by ~3-4×.
+__device__ inline uint8_t lut_lookup_reg(uint32_t lut_reg, uint64_t index) {
+  uint32_t word = __shfl_sync(0xFFFFFFFF, lut_reg, (uint32_t)(index >> 2));
+  return (word >> (uint32_t)((index & 3) * 8)) & 0xFF;
+}
+
+__device__ inline void huffman_decode_tile_in_smem(
+  const uint8_t* compressed,
+  int start_bit_offset,
+  const uint8_t* lut,   // kept for API compatibility; unused when lut_reg is valid
+  uint8_t* output_tile,
+  int lane,
+  uint32_t lut_reg      // warp-register LUT: 4 bytes per thread across 32-thread warp
+) {
+  int byte_idx = start_bit_offset >> 3;
+  int bit_idx = start_bit_offset & 7;
+  // Load 8 bytes in one smem transaction instead of 8 separate byte reads.
+  uint64_t state;
+  memcpy(&state, compressed + byte_idx, sizeof(uint64_t));
+  state >>= bit_idx;
+
+  constexpr uint64_t MASK = (1u << HUFFMAN_MAX_CODE_LEN) - 1u;
+  uint8_t decoded[HUFFMAN_SYMBOLS_PER_THREAD];
+  #pragma unroll
+  for (int i = 0; i < HUFFMAN_SYMBOLS_PER_THREAD; i++) {
+    uint8_t entry = lut_lookup_reg(lut_reg, state & MASK);
+    uint8_t code_len = entry >> 4;
+    decoded[i] = entry & 0x0f;
+    state >>= code_len;
+  }
+
+  // Pack 4 output bytes into one 32-bit word and write with a single STS.32
+  // instead of 4 separate STS.8 instructions.
+  int out_base = lane * (HUFFMAN_SYMBOLS_PER_THREAD / 2);
+  uint32_t packed = ((uint32_t)(decoded[0] | (decoded[1] << 4)))
+                  | ((uint32_t)(decoded[2] | (decoded[3] << 4)) <<  8)
+                  | ((uint32_t)(decoded[4] | (decoded[5] << 4)) << 16)
+                  | ((uint32_t)(decoded[6] | (decoded[7] << 4)) << 24);
+  *reinterpret_cast<uint32_t*>(output_tile + out_base) = packed;
+}
+
+
 
 template <
   const int threads, // number of threads in a threadblock
@@ -192,13 +243,19 @@ template <
   const int thread_n_blocks, // same for n dimension (output) 
   const int thread_k_blocks, // same for k dimension (reduction)
   const int stages, // number of stages for the async global->shared fetch pipeline
-  const int group_blocks = -1 // number of consecutive 16x16 blocks with a separate quantization scale
+  const int group_blocks = -1, // number of consecutive 16x16 blocks with a separate quantization scale
+  const bool use_huffman = false
 >
 __global__ void Marlin(
   const int4* __restrict__ A, // fp16 input matrix of shape mxk 
   const int4* __restrict__ B, // 4bit quantized weight matrix of shape kxn 
         int4* __restrict__ C, // fp16 output buffer of shape mxn
   const int4* __restrict__ s, // fp16 quantization scales of shape (k/groupsize)xn 
+  const uint8_t* __restrict__ huffman_bitstream,
+  const int32_t* __restrict__ tile_byte_offsets,
+  const uint16_t* __restrict__ tile_gaps,
+  const uint8_t* __restrict__ huffman_lut,
+  int max_stage_comp_bytes,
   int  prob_m, // batch dimension m
   int  prob_n, // output dimension n
   int  prob_k, // reduction dimension k
@@ -361,20 +418,62 @@ __global__ void Marlin(
   // Since B-accesses have non-constant stride they have to be computed at runtime; we break dependicies between
   // subsequent accesses with a tile by maintining multiple pointers (we have enough registers), a tiny optimization.
   const int4* B_ptr[b_sh_wr_iters];
-  #pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; i++)
-    B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
+  if constexpr (!use_huffman) {
+    #pragma unroll
+    for (int i = 0; i < b_sh_wr_iters; i++)
+      B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
+  }
 
   extern __shared__ int4 sh[];
   // Shared memory storage for global fetch pipelines. 
   int4* sh_a = sh;
   int4* sh_b = sh_a + (stages * a_sh_stage);
   int4* sh_s = sh_b + (stages * b_sh_stage);
+  uint8_t* sh_huffman_lut = nullptr;
+  uint8_t* sh_b_compressed = nullptr;
+  if constexpr (use_huffman) {
+    static_assert(threads == 2 * HUFFMAN_THREADS_PER_TILE, "The fused Huffman path expects 256 threads.");
+    static_assert(group_blocks == -1, "The fused Huffman path currently supports only per-column scales.");
+    uint8_t* sh_extra = reinterpret_cast<uint8_t*>(sh_s + (stages * s_sh_stage));
+    sh_huffman_lut = sh_extra;
+    uintptr_t sh_comp_ptr = reinterpret_cast<uintptr_t>(
+      sh_huffman_lut + 128
+    );
+    sh_comp_ptr = (sh_comp_ptr + HUFFMAN_TILE_ALIGN_BYTES - 1) & ~(uintptr_t(HUFFMAN_TILE_ALIGN_BYTES - 1));
+    sh_b_compressed = reinterpret_cast<uint8_t*>(sh_comp_ptr);
+  }
   // Register storage for double buffer of shared memory reads. 
   FragA frag_a[2][thread_m_blocks];
   I4 frag_b_quant[2];
   FragC frag_c[thread_m_blocks][4][2];
   FragS frag_s[2][4];
+  int huffman_stage_row = slice_row;
+  int huffman_stage_id[stages];
+  bool huffman_stage_valid[stages];
+  if constexpr (use_huffman) {
+    #pragma unroll
+    for (int i = 0; i < stages; i++) {
+      huffman_stage_id[i] = 0;
+      huffman_stage_valid[i] = false;
+    }
+  }
+
+  // Warp-register LUT: each warp (32 threads) collectively stores all 128 LUT bytes in
+  // registers (4 bytes per thread).  Lookups use __shfl_sync (~4-6 cy) instead of
+  // shared memory (~22 cy), reducing the serial decode chain latency by ~3-4×.
+  uint32_t lut_reg = 0;
+  if constexpr (use_huffman) {
+    if (threadIdx.x < 128)
+      sh_huffman_lut[threadIdx.x] = huffman_lut[threadIdx.x];
+    __syncthreads();
+    // Each thread in its warp holds 4 consecutive LUT bytes.
+    int local_lane = threadIdx.x % 32;
+    lut_reg = (uint32_t)sh_huffman_lut[local_lane * 4 + 0]
+            | ((uint32_t)sh_huffman_lut[local_lane * 4 + 1] << 8)
+            | ((uint32_t)sh_huffman_lut[local_lane * 4 + 2] << 16)
+            | ((uint32_t)sh_huffman_lut[local_lane * 4 + 3] << 24);
+  }
+
 
   // Zero accumulators.
   auto zero_accums = [&] () {
@@ -395,19 +494,46 @@ __global__ void Marlin(
           a_sh_wr_pred[i]
         );
       }
-      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
-      #pragma unroll
-      for (int i = 0; i < b_sh_wr_iters; i++) {
-        cp_async4_stream(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr], B_ptr[i]);
-        B_ptr[i] += b_gl_rd_delta_o;
+      if constexpr (!use_huffman) {
+        int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+        #pragma unroll
+        for (int i = 0; i < b_sh_wr_iters; i++) {
+          cp_async4_stream(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr], B_ptr[i]);
+          B_ptr[i] += b_gl_rd_delta_o;
+        }
+        // Only fetch scales if this tile starts a new group.
+        if constexpr (group_blocks != -1) {
+          if (pipe % (group_blocks / thread_k_blocks) == 0) {
+            int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+            if (s_sh_wr_pred)
+              cp_async4_stream(&sh_s_stage[s_sh_wr], &s[s_gl_rd]);
+            s_gl_rd += s_gl_rd_delta;
+          }
+        }
+      } else {
+        int stage_id = huffman_stage_row * n_tiles + slice_col;
+        huffman_stage_id[pipe] = stage_id;
+        huffman_stage_valid[pipe] = true;
+        int stage_tile_base = stage_id * HUFFMAN_SUBTILES_PER_STAGE;
+        int stage_start = tile_byte_offsets[stage_tile_base];
+        int stage_end = tile_byte_offsets[stage_tile_base + HUFFMAN_SUBTILES_PER_STAGE];
+        int stage_size = stage_end - stage_start;
+        int stage_chunks = stage_size / sizeof(int4);
+        int huffman_comp_stage_stride = max_stage_comp_bytes + HUFFMAN_TILE_ALIGN_BYTES;
+        uint8_t* sh_b_comp_stage = sh_b_compressed + pipe * huffman_comp_stage_stride;
+        #pragma unroll 1
+        for (int idx = threadIdx.x; idx < stage_chunks; idx += threads) {
+          cp_async4_stream(
+            sh_b_comp_stage + sizeof(int4) * idx,
+            huffman_bitstream + stage_start + sizeof(int4) * idx
+          );
+        }
+        if (threadIdx.x < HUFFMAN_BITSTREAM_TRAILER_BYTES)
+          sh_b_comp_stage[stage_size + threadIdx.x] = huffman_bitstream[stage_end + threadIdx.x];
+        huffman_stage_row++;
       }
-      // Only fetch scales if this tile starts a new group
-      if (group_blocks != -1 && pipe % (group_blocks / thread_k_blocks) == 0) {
-        int4* sh_s_stage = sh_s + s_sh_stage * pipe;
-        if (s_sh_wr_pred)
-          cp_async4_stream(&sh_s_stage[s_sh_wr], &s[s_gl_rd]);
-        s_gl_rd += s_gl_rd_delta;
-      }
+    } else if constexpr (use_huffman) {
+      huffman_stage_valid[pipe] = false;
     }
     // Insert a fence even when we are winding down the pipeline to ensure that waiting is also correct at this point.
     cp_async_fence();
@@ -421,12 +547,52 @@ __global__ void Marlin(
     __syncthreads();
   };
 
+  auto decode_huffman_stage = [&] (int pipe) {
+    if constexpr (use_huffman) {
+      if (!huffman_stage_valid[pipe])
+        return;
+      int stage_id = huffman_stage_id[pipe];
+      uint8_t* sh_b_stage_bytes = reinterpret_cast<uint8_t*>(sh_b + b_sh_stage * pipe);
+      int huffman_comp_stage_stride = max_stage_comp_bytes + HUFFMAN_TILE_ALIGN_BYTES;
+      uint8_t* sh_b_comp_stage = sh_b_compressed + pipe * huffman_comp_stage_stride;
+      int half_group = threadIdx.x / HUFFMAN_THREADS_PER_TILE;
+      int lane = threadIdx.x % HUFFMAN_THREADS_PER_TILE;
+      int stage_tile_base = stage_id * HUFFMAN_SUBTILES_PER_STAGE;
+      // Two-pass structure: issue all LDG reads first (pass 1) so the compiler
+      // batches them before the SHFL chains begin (pass 2), hiding L2 latency.
+      int32_t stage_start = tile_byte_offsets[stage_tile_base];
+      int32_t pre_tile_start[HUFFMAN_SUBTILES_PER_STAGE / 2];
+      uint16_t pre_bit_offset[HUFFMAN_SUBTILES_PER_STAGE / 2];
+      #pragma unroll
+      for (int sp = 0; sp < HUFFMAN_SUBTILES_PER_STAGE / 2; sp++) {
+        int subtile = 2 * sp + half_group;
+        int tile_id = stage_tile_base + subtile;
+        pre_tile_start[sp] = tile_byte_offsets[tile_id] - stage_start;
+        pre_bit_offset[sp] = tile_gaps[tile_id * HUFFMAN_THREADS_PER_TILE + lane];
+      }
+      #pragma unroll
+      for (int subtile_pair = 0; subtile_pair < HUFFMAN_SUBTILES_PER_STAGE / 2; subtile_pair++) {
+        int subtile = 2 * subtile_pair + half_group;
+        huffman_decode_tile_in_smem(
+          sh_b_comp_stage + pre_tile_start[subtile_pair],
+          pre_bit_offset[subtile_pair],
+          sh_huffman_lut,
+          sh_b_stage_bytes + subtile * HUFFMAN_TILE_OUTPUT_BYTES,
+          lane,
+          lut_reg
+        );
+      }
+      __syncthreads();
+      huffman_stage_valid[pipe] = false;
+    }
+  };
+
   // Load the next sub-tile from the current location in the shared memory pipe into the current register buffer.
   auto fetch_to_registers = [&] (int k, int pipe) {
     // It may seem inefficient that we reload the groups for every sub-tile; however, this does not seem to be a
     // significant bottleneck, while some theoretically better attempts have lead to bad instruction ordering by the
     // compiler and correspondingly a noticable drop in performance.
-    if (group_blocks != -1) {
+    if constexpr (group_blocks != -1) {
       int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
       reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
     }
@@ -619,11 +785,19 @@ __global__ void Marlin(
 
   // Start global fetch and register load pipelines. 
   auto start_pipes = [&] () {
-    #pragma unroll
-    for (int i = 0; i < stages - 1; i++)
-      fetch_to_shared(i, i, i < slice_iters);
     zero_accums();
-    wait_for_stage();
+    if constexpr (!use_huffman) {
+      #pragma unroll
+      for (int i = 0; i < stages - 1; i++)
+        fetch_to_shared(i, i, i < slice_iters);
+      wait_for_stage();
+    } else {
+      #pragma unroll
+      for (int i = 0; i < stages - 1; i++)
+        fetch_to_shared(i, i, i < slice_iters);
+      wait_for_stage();
+      decode_huffman_stage(0);
+    }
     fetch_to_registers(0, 0);
     a_gl_rd += a_gl_rd_delta_o * (stages - 1);
   };
@@ -635,15 +809,31 @@ __global__ void Marlin(
     // static. Note that both pipelines have even length meaning that the next iteration will always start at index 0.
     #pragma unroll
     for (int pipe = 0; pipe < stages;) {
-      #pragma unroll
-      for (int k = 0; k < b_sh_wr_iters; k++) {
-        fetch_to_registers(k + 1, pipe % stages);
-        if (k == b_sh_wr_iters - 2) {
-          fetch_to_shared((pipe + stages - 1) % stages, pipe, slice_iters >= stages);
-          pipe++;
-          wait_for_stage();
+      if constexpr (!use_huffman) {
+        #pragma unroll
+        for (int k = 0; k < b_sh_wr_iters; k++) {
+          fetch_to_registers(k + 1, pipe % stages);
+          if (k == b_sh_wr_iters - 2) {
+            fetch_to_shared((pipe + stages - 1) % stages, pipe, slice_iters >= stages);
+            pipe++;
+            wait_for_stage();
+          }
+          matmul(k);
         }
-        matmul(k);
+      } else {
+        #pragma unroll
+        for (int k = 0; k < b_sh_wr_iters; k++) {
+          fetch_to_registers(k + 1, pipe % stages);
+          if (k == b_sh_wr_iters - 2) {
+            fetch_to_shared((pipe + stages - 1) % stages, pipe, slice_iters >= stages);
+            pipe++;
+          }
+          matmul(k);
+          if (k == b_sh_wr_iters - 2) {
+            wait_for_stage();
+            decode_huffman_stage(pipe % stages);
+          }
+        }
       }
       slice_iters--;
       if (slice_iters == 0)
@@ -684,13 +874,17 @@ __global__ void Marlin(
       init_slice();
       if (slice_iters) {
         a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
-        #pragma unroll
-        for (int i = 0; i < b_sh_wr_iters; i++)
-          B_ptr[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
-        if (slice_col == 0) {
+        if constexpr (!use_huffman) {
           #pragma unroll
           for (int i = 0; i < b_sh_wr_iters; i++)
-            B_ptr[i] -= b_gl_stride;
+            B_ptr[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
+          if (slice_col == 0) {
+            #pragma unroll
+            for (int i = 0; i < b_sh_wr_iters; i++)
+              B_ptr[i] -= b_gl_stride;
+          }
+        } else {
+          huffman_stage_row = slice_row;
         }
         s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
         start_pipes();
@@ -712,14 +906,43 @@ const int SHARED_MEM = 96 * 1024; // max shared memory on compute capability 8.6
     group_blocks == GROUP_BLOCKS \
   ) { \
     cudaFuncSetAttribute( \
-      Marlin<THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS>, \
+      Marlin<THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS, false>, \
       cudaFuncAttributeMaxDynamicSharedMemorySize, \
       SHARED_MEM \
     ); \
     Marlin< \
-      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS \
+      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS, false \
     ><<<blocks, THREADS, SHARED_MEM, stream>>>( \
       A_ptr, B_ptr, C_ptr, s_ptr, \
+      nullptr, nullptr, nullptr, nullptr, 0, \
+      prob_m, prob_n, prob_k, \
+      locks \
+    ); \
+  }
+
+#define CALL_IF_HUFFMAN(THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS) \
+  else if ( \
+    thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS && thread_k_blocks == THREAD_K_BLOCKS \
+  ) { \
+    int required_shared = \
+      (STAGES * ( \
+        (16 * THREAD_K_BLOCKS / 8) * (16 * THREAD_M_BLOCKS) + \
+        (32 * THREAD_N_BLOCKS / 4) * THREAD_K_BLOCKS + \
+        (16 * THREAD_N_BLOCKS / 8) \
+      )) * sizeof(int4) + \
+      128 + (HUFFMAN_TILE_ALIGN_BYTES - 1) + STAGES * (max_stage_comp_bytes + HUFFMAN_TILE_ALIGN_BYTES); \
+    if (required_shared > SHARED_MEM) \
+      return ERR_KERN_SHAPE; \
+    cudaFuncSetAttribute( \
+      Marlin<THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, -1, true>, \
+      cudaFuncAttributeMaxDynamicSharedMemorySize, \
+      required_shared \
+    ); \
+    Marlin< \
+      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, -1, true \
+    ><<<blocks, THREADS, required_shared, stream>>>( \
+      A_ptr, nullptr, C_ptr, s_ptr, \
+      bitstream_ptr, tile_byte_offsets_ptr, tile_gaps_ptr, huffman_lut_ptr, max_stage_comp_bytes, \
       prob_m, prob_n, prob_k, \
       locks \
     ); \
@@ -818,5 +1041,99 @@ int marlin_cuda(
   return ret;
 }
 
+int marlin_cuda_huffman(
+  const void* A,
+  const void* bitstream,
+        void* C,
+        void* s,
+  const void* huffman_lut,
+  const void* tile_byte_offsets,
+  const void* tile_gaps,
+  int max_stage_comp_bytes,
+  int prob_m,
+  int prob_n,
+  int prob_k,
+  void* workspace,
+  int groupsize = -1,
+  int dev = 0,
+  cudaStream_t stream = 0,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int max_par = 16
+) {
+  if (groupsize != -1)
+    return ERR_KERN_SHAPE;
+  if (max_stage_comp_bytes <= 0 || max_stage_comp_bytes % HUFFMAN_TILE_ALIGN_BYTES != 0)
+    return ERR_KERN_SHAPE;
+
+  int tot_m = prob_m;
+  int tot_m_blocks = ceildiv(tot_m, 16);
+  int pad = 16 * tot_m_blocks - tot_m;
+
+  if (sms == -1)
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  if (thread_k == -1 || thread_n == -1) {
+    if (prob_m <= 16) {
+      thread_k = 128;
+      thread_n = 128;
+    } else {
+      thread_k = 64;
+      thread_n = 256;
+    }
+  }
+
+  int thread_k_blocks = thread_k / 16;
+  int thread_n_blocks = thread_n / 16;
+  int blocks = sms;
+
+  if (prob_n % thread_n != 0 || prob_k % thread_k != 0)
+    return ERR_PROB_SHAPE;
+  if (prob_m == 0 || prob_n == 0 || prob_k == 0)
+    return 0;
+
+  const int4* A_ptr = (const int4*) A;
+  const uint8_t* bitstream_ptr = (const uint8_t*) bitstream;
+  int4* C_ptr = (int4*) C;
+  const int4* s_ptr = (const int4*) s;
+  const uint8_t* huffman_lut_ptr = (const uint8_t*) huffman_lut;
+  const int32_t* tile_byte_offsets_ptr = (const int32_t*) tile_byte_offsets;
+  const uint16_t* tile_gaps_ptr = (const uint16_t*) tile_gaps;
+
+  int* locks = (int*) workspace;
+
+  int ret = 0;
+  for (int i = 0; i < tot_m_blocks; i += 4) {
+    int thread_m_blocks = tot_m_blocks - i;
+    prob_m = tot_m - 16 * i;
+    int par = 1;
+    if (thread_m_blocks > 4) {
+      par = (16 * thread_m_blocks - pad) / 64;
+      if (par > max_par)
+        par = max_par;
+      prob_m = 64 * par;
+      i += 4 * (par - 1);
+      thread_m_blocks = 4;
+    }
+
+    if (false) {}
+    CALL_IF_HUFFMAN(1,  8,  8)
+    CALL_IF_HUFFMAN(1, 16,  4)
+    CALL_IF_HUFFMAN(2, 16,  4)
+    CALL_IF_HUFFMAN(3, 16,  4)
+    CALL_IF_HUFFMAN(4, 16,  4)
+    else
+      ret = ERR_KERN_SHAPE;
+
+    A_ptr += 16 * thread_m_blocks * (prob_k / 8) * par;
+    C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par;
+  }
+
+  return ret;
+}
+
+
+// CuTe-based kernel
+#include "marlin_cute_kernel.cuh"
 
 #endif
