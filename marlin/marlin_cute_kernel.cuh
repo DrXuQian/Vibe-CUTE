@@ -61,17 +61,6 @@ __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool
   );
 }
 
-// cp.async 16B with cache-global hint (used for scales S)
-__device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
-  const int BYTES = 16;
-  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-    "{\n"
-    "   cp.async.cg.shared.global [%0], [%1], %2;\n"
-    "}\n" :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
-  );
-}
-
 // lop3: 3-input logical operation (used by INT4 dequantization)
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
@@ -445,12 +434,15 @@ __global__ void MarlinCute(
         b_k_row += thread_k_blocks;  // advance to next K-tile
       }
 
-      // --- Scales: fetch once per quantization group ---
+      // --- Scales: fetch once per quantization group via CuTe cp.async ---
       if constexpr (group_blocks != -1) {
         if (pipe % (group_blocks / thread_k_blocks) == 0) {
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
-          if (s_sh_wr_pred)
-            marlin_cute::cp_async4_stream(&sh_s_stage[s_sh_wr], &s[s_gl_rd]);
+          if (s_sh_wr_pred) {
+            auto src = make_tensor(make_gmem_ptr(&s[s_gl_rd]), Int<1>{});
+            auto dst = make_tensor(make_smem_ptr(&sh_s_stage[s_sh_wr]), Int<1>{});
+            copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, int4>{}, src, dst);
+          }
           s_gl_rd += s_gl_rd_delta;
         }
       }
@@ -743,8 +735,11 @@ __global__ void MarlinCute(
 
       // Per-column scales: fetch in the final step before write-out
       if (group_blocks == -1 && last) {
-        if (s_sh_wr_pred)
-          marlin_cute::cp_async4_stream(&sh_s[s_sh_wr], &s[s_gl_rd]);
+        if (s_sh_wr_pred) {
+          auto src = make_tensor(make_gmem_ptr(&s[s_gl_rd]), Int<1>{});
+          auto dst = make_tensor(make_smem_ptr(&sh_s[s_sh_wr]), Int<1>{});
+          copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, int4>{}, src, dst);
+        }
         cute::cp_async_fence();
       }
 
