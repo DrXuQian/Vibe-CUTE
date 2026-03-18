@@ -48,19 +48,6 @@ constexpr int ceildiv_cute(int a, int b) {
 
 namespace marlin_cute {
 
-// Predicated cp.async 16B: global -> shared (used for A with M-bounds check)
-__device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool pred = true) {
-  const int BYTES = 16;
-  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-    "{\n"
-    "   .reg .pred p;\n"
-    "   setp.ne.b32 p, %0, 0;\n"
-    "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
-    "}\n" :: "r"((int) pred), "r"(smem), "l"(glob_ptr), "n"(BYTES)
-  );
-}
-
 // lop3: 3-input logical operation (used by INT4 dequantization)
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
@@ -598,11 +585,11 @@ __global__ void MarlinCute(
       if (!first) {
         #pragma unroll
         for (int i = 0; i < thread_m_blocks * 4; i++) {
-          marlin_cute::cp_async4_pred(
-            &sh[c_sh_wr + c_sh_wr_delta * i],
-            &C_cur[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)],
-            i < (thread_m_blocks - 1) * 4 || 8 * (i / 2) + row < prob_m
-          );
+          if (i < (thread_m_blocks - 1) * 4 || 8 * (i / 2) + row < prob_m) {
+            auto src = make_tensor(make_gmem_ptr(&C_cur[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)]), Int<1>{});
+            auto dst = make_tensor(make_smem_ptr(&sh[c_sh_wr + c_sh_wr_delta * i]), Int<1>{});
+            copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, int4>{}, src, dst);
+          }
         }
         cute::cp_async_fence();
         cute::cp_async_wait<0>();
