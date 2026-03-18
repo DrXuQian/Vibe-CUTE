@@ -281,14 +281,24 @@ __global__ void MarlinCute(
     Layout<Shape<_1, _1>>{}
   ));
 
-  // --- A SMEM -> Reg via TiledMMA + ldmatrix (Step 6.2) ---
-  // Standard CuTe pattern: make_tiled_copy_A + retile_D bridges
-  // ldmatrix copy atom with MMA-compatible register layout.
+  // --- TiledMMA with MmaPermutations ---
+  // MmaPermutations encode Marlin's N iteration order:
+  //   _2 (b0,b1 halves) × _4 (j subtiles) × N_WARPS_N × _8 (atom N)
+  // This enables make_tiled_copy_C + retile_S for the R2S epilog.
   constexpr int N_WARPS_N = thread_n_blocks / 4;
   constexpr int N_WARPS_K = (threads / 32) / N_WARPS_N;
+  using MmaPermuteNLayout = Layout<
+    Shape<_2, _4, Int<N_WARPS_N>, _8>,
+    Stride<_1, _2, _64, _8>>;
+  using MmaPermutations = decltype(make_tile(
+    Int<16>{},                   // M = atom_M
+    MmaPermuteNLayout{},         // N = full CTA N with dequant interleave
+    Int<N_WARPS_K * 16>{}        // K = K per pipeline step
+  ));
   using TiledMma = TiledMMA<
     MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
-    Layout<Shape<_1, Int<N_WARPS_N>, Int<N_WARPS_K>>>
+    Layout<Shape<_1, Int<N_WARPS_N>, Int<N_WARPS_K>>>,
+    MmaPermutations
   >;
   using SmemCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, cute::half_t>;
 
@@ -353,14 +363,17 @@ __global__ void MarlinCute(
   auto tCrA_buf1 = thr_mma.partition_fragment_A(sA_dummy);
 
   I4    frag_b_quant[2];                      // packed INT4 B fragments (double-buffered)
-  // C accumulators: CuTe register tensor (4 float per MMA, m_blocks M, 8 N-subtiles)
-  // Layout: (v=4, m=m_blocks, n=8) with strides (1, 32, 4) to match original frag_c[m][4][2]
-  // Access: tCrC(v, m_block, j*2+b) ↔ old frag_c[m_block][j][b].elems[v]
-  auto tCrC = make_tensor<float>(
-    make_shape(_4{}, Int<thread_m_blocks>{}, _8{}),
-    make_stride(_1{}, Int<32>{}, _4{})
-  );
+  // C accumulators via partition_fragment_C: shape ((_2,_2), m_blocks, 8)
+  // mode 0 = 4 float per MMA, mode 1 = M tiles, mode 2 = N tiles (8 = 4 subtiles × 2 halves)
+  auto gC_dummy = make_tensor(make_gmem_ptr((cute::half_t*)nullptr),
+    make_shape(Int<16 * thread_m_blocks>{}, Int<16 * thread_n_blocks>{}), LayoutRight{});
+  auto tCrC = thr_mma.partition_fragment_C(gC_dummy);
   FragS frag_s[2][4];                         // scale fragments (double-buffered)
+
+  // R2S epilog: make_tiled_copy_C for register→smem shuffle
+  using R2SCCopyAtom = Copy_Atom<UniversalCopy<int>, cute::half_t>;
+  auto r2s_copy = make_tiled_copy_C(R2SCCopyAtom{}, tiled_mma);
+  auto thr_r2s = r2s_copy.get_thread_slice(threadIdx.x);
 
   // ========================================================================
   // Lambda: Zero accumulators
@@ -625,72 +638,72 @@ __global__ void MarlinCute(
   // Lambda: Write final result to global C
   // ========================================================================
 
-  // Epilog smem layout for C: (M, N) in int4 with +1 padding to avoid bank conflicts
-  // Same as original c_sh_stride = 2 * thread_n_blocks + 1
-  constexpr int C_SH_N = 2 * thread_n_blocks;     // N-tiles in int4
-  constexpr int C_SH_STRIDE = C_SH_N + 1;         // padded stride
+  // Epilog smem layout for C: (M, N) in half_t with +8 padding to avoid bank conflicts
+  constexpr int CTA_N = 16 * thread_n_blocks;
   using SmemLayoutC = decltype(make_layout(
-    make_shape(Int<16 * thread_m_blocks>{}, Int<C_SH_N>{}),
-    make_stride(Int<C_SH_STRIDE>{}, _1{})
+    make_shape(Int<16 * thread_m_blocks>{}, Int<CTA_N>{}),
+    make_stride(Int<CTA_N + 8>{}, _1{})
   ));
 
-  // S2G TiledCopy for C: 256 threads, each copies 1 int4 (8 fp16)
-  constexpr int C_S2G_N_THREADS = C_SH_N;
+  // S2G TiledCopy for C: 256 threads, each copies 8 half_t (uint128_t)
+  constexpr int C_S2G_VEC = 8;  // 8 half_t = 16 bytes
+  constexpr int C_S2G_N_THREADS = CTA_N / C_S2G_VEC;
   constexpr int C_S2G_M_THREADS = threads / C_S2G_N_THREADS;
-  using S2GCCopyAtom = Copy_Atom<UniversalCopy<cute::uint128_t>, int4>;
+  using S2GCCopyAtom = Copy_Atom<UniversalCopy<cute::uint128_t>, cute::half_t>;
   using S2GCCopy = decltype(make_tiled_copy(
     S2GCCopyAtom{},
     make_layout(make_shape(Int<C_S2G_M_THREADS>{}, Int<C_S2G_N_THREADS>{}),
                 make_stride(Int<C_S2G_N_THREADS>{}, _1{})),
-    Layout<Shape<_1, _1>>{}
+    Layout<Shape<_1, Int<C_S2G_VEC>>>{}
   ));
 
   auto write_result = [&] () {
-    // Stage 1: Pack frag_c (FP32) -> shared memory (FP16) — manual MMA-specific shuffle
-    // Only active warps (those assigned to N) participate
-    constexpr int c_sh_stride = C_SH_STRIDE;
-    int c_sh_wr = (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
-    c_sh_wr += 32 * (threadIdx.x / 32);
-
-    auto write = [&] (int idx, float c0, float c1, FragS& s_frag) {
-      half2 res = __halves2half2(__float2half(c0), __float2half(c1));
-      if (group_blocks == -1)
-        res = __hmul2(res, s_frag[0]);
-      ((half2*) sh)[idx] = res;
-    };
-
+    // Stage 1: FP32 -> FP16 + scale, then R2S via make_tiled_copy_C + retile_S
+    // Convert tCrC (FP32) to FP16, applying per-column scale if needed
+    auto tCrC_fp16 = make_tensor_like<cute::half_t>(tCrC);
     if (threadIdx.x / 32 < thread_n_blocks / 4) {
       #pragma unroll
-      for (int i = 0; i < thread_m_blocks; i++) {
+      for (int m = 0; m < size<1>(tCrC); m++) {
         #pragma unroll
-        for (int j = 0; j < 4; j++) {
-          int wr = c_sh_wr + 8 * j;
-          write(wr + (4 * c_sh_stride) * 0 + 0, tCrC(0, i, j*2), tCrC(1, i, j*2), frag_s[j / 2][2 * (j % 2) + 0]);
-          write(wr + (4 * c_sh_stride) * 8 + 0, tCrC(2, i, j*2), tCrC(3, i, j*2), frag_s[j / 2][2 * (j % 2) + 0]);
-          write(wr + (4 * c_sh_stride) * 0 + 4, tCrC(0, i, j*2+1), tCrC(1, i, j*2+1), frag_s[j / 2][2 * (j % 2) + 1]);
-          write(wr + (4 * c_sh_stride) * 8 + 4, tCrC(2, i, j*2+1), tCrC(3, i, j*2+1), frag_s[j / 2][2 * (j % 2) + 1]);
+        for (int n = 0; n < size<2>(tCrC); n++) {
+          // Per-column scale: apply at write-out (grouped scale already applied in matmul)
+          #pragma unroll
+          for (int v = 0; v < size<0>(tCrC); v += 2) {
+            half2 res = __halves2half2(__float2half(tCrC(v, m, n)),
+                                       __float2half(tCrC(v + 1, m, n)));
+            if (group_blocks == -1) {
+              int j = n / 2, b = n % 2;
+              res = __hmul2(res, frag_s[j / 2][2 * (j % 2) + b][0]);
+            }
+            reinterpret_cast<half2*>(&tCrC_fp16(v, m, n))[0] = res;
+          }
         }
-        c_sh_wr += 16 * (4 * c_sh_stride);
       }
+    }
+
+    // R2S: use make_tiled_copy_C + retile_S to handle MMA register shuffle
+    // Only N-warps (warp_id < N_WARPS_N) have valid C data after thread_block_reduce
+    auto sC = make_tensor(make_smem_ptr(reinterpret_cast<cute::half_t*>(sh)), SmemLayoutC{});
+    auto r2s_tCrC = thr_r2s.retile_S(tCrC_fp16);
+    auto r2s_tCsC = thr_r2s.partition_D(sC);
+    if (threadIdx.x / 32 < thread_n_blocks / 4) {
+      copy(r2s_copy, r2s_tCrC, r2s_tCsC);
     }
     __syncthreads();
 
-    // Stage 2: Stream shared -> global C via CuTe TiledCopy
-    auto sC = make_tensor(make_smem_ptr(sh), SmemLayoutC{});
-    // Global C tile for this CTA's output
+    // Stage 2: S2G via CuTe TiledCopy with M-bounds predication
     int4* C_cur = cur_C();
     int c_gl_stride = prob_n / 8;
     auto gC_tile = make_tensor(
-      make_gmem_ptr(C_cur + C_SH_N * tile_work.n_idx),
-      make_shape(Int<16 * thread_m_blocks>{}, Int<C_SH_N>{}),
-      make_stride(c_gl_stride, _1{})
+      make_gmem_ptr(reinterpret_cast<cute::half_t*>(C_cur) + CTA_N * tile_work.n_idx),
+      make_shape(Int<16 * thread_m_blocks>{}, Int<CTA_N>{}),
+      make_stride(prob_n, _1{})
     );
 
     S2GCCopy s2g_c_copy;
     auto thr_s2g = s2g_c_copy.get_thread_slice(threadIdx.x);
-    auto tCsC = thr_s2g.partition_S(sC);
+    auto tCsC_s2g = thr_s2g.partition_S(sC);
     auto tCgC = thr_s2g.partition_D(gC_tile);
-    // Predication via identity tensor for M-bounds
     auto gC_identity = make_identity_tensor(shape(gC_tile));
     auto tCgC_id = thr_s2g.partition_D(gC_identity);
     #pragma unroll
@@ -698,7 +711,7 @@ __global__ void MarlinCute(
       if (get<0>(tCgC_id(_0{}, m, _0{})) < prob_m) {
         #pragma unroll
         for (int n = 0; n < size<2>(tCgC); n++)
-          copy(s2g_c_copy, tCsC(_, m, n), tCgC(_, m, n));
+          copy(s2g_c_copy, tCsC_s2g(_, m, n), tCgC(_, m, n));
       }
     }
   };
