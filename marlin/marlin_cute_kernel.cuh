@@ -336,16 +336,16 @@ __global__ void MarlinCute(
     Layout<Shape<_1, _1>>{}
   ));
 
-  // --- A SMEM -> Reg via TiledMMA partition (Direction 2 / Step 6.2) ---
-  // Use TiledMMA to partition smem A and create register fragments.
-  // copy(tCsA, tCrA) produces identical register layout to ldmatrix.
-  // Warp layout: (1 on M, N_WARPS_N on N, N_WARPS_K on K)
+  // --- A SMEM -> Reg via TiledMMA + ldmatrix (Step 6.2) ---
+  // Standard CuTe pattern: make_tiled_copy_A + retile_D bridges
+  // ldmatrix copy atom with MMA-compatible register layout.
   constexpr int N_WARPS_N = thread_n_blocks / 4;
   constexpr int N_WARPS_K = (threads / 32) / N_WARPS_N;
   using TiledMma = TiledMMA<
     MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
     Layout<Shape<_1, Int<N_WARPS_N>, Int<N_WARPS_K>>>
   >;
+  using SmemCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, cute::half_t>;
 
   // ========================================================================
   // Per-Thread Index Computation
@@ -381,9 +381,11 @@ __global__ void MarlinCute(
   GmemTiledCopyB gmem_tiled_copy_b;
   auto gmem_thr_copy_b = gmem_tiled_copy_b.get_thread_slice(threadIdx.x);
 
-  // TiledMMA for A smem->reg partitioning
+  // TiledMMA + ldmatrix-compatible smem->reg copy for A
   TiledMma tiled_mma;
   auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
+  auto smem_tiled_copy_a = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+  auto smem_thr_copy_a = smem_tiled_copy_a.get_thread_slice(threadIdx.x);
 
   // Precompute A gmem->smem predicate
   // Thread tid maps to row = tid / A_TILE_K_INT4 for each M-iteration
@@ -501,28 +503,30 @@ __global__ void MarlinCute(
       reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
     }
 
-    // A: smem -> reg via CuTe TiledMMA partition
-    // partition_A gives MMA-compatible smem view, partition_fragment_A gives
-    // matching register tensor. copy() auto-vectorizes the transfer.
+    // A: smem -> reg via make_tiled_copy_A + retile_D (ldmatrix)
+    // Standard CuTe pattern: smem_thr_copy_a.partition_S for smem source,
+    // retile_D to bridge MMA fragment layout with ldmatrix dest layout.
     {
       auto sA_stage = make_tensor(
         make_smem_ptr(reinterpret_cast<cute::half_t*>(sh_a + a_sh_stage * pipe)),
         SmemLayoutA{}
       );
-      auto tCsA = thr_mma.partition_A(sA_stage);           // (MMA=8, MMA_M, MMA_K)
+      // Partition smem for ldmatrix copy
+      auto tCsA = smem_thr_copy_a.partition_S(sA_stage);   // (CPY, CPY_M, CPY_K)
 
-      // Create register fragment backed by frag_a storage
-      // partition_fragment_A shape: (MMA=8, MMA_M=m_blocks, MMA_K=b_sh_wr_iters)
-      // Each (MMA=8) slice = 8 half_t = 4 half2 = 1 FragA
+      // Create MMA register fragment and retile for ldmatrix dest
+      auto tCrA_mma = thr_mma.partition_fragment_A(sA_stage); // (MMA, MMA_M, MMA_K)
+      auto tCrA_copy = smem_thr_copy_a.retile_D(tCrA_mma);   // (CPY, CPY_M, CPY_K)
+
       int k_subtile = k % b_sh_wr_iters;
+      // Copy smem -> reg using ldmatrix instruction
+      copy(smem_tiled_copy_a, tCsA(_, _, k_subtile), tCrA_copy(_, _, k_subtile));
+
+      // Transfer from CuTe register tensor to frag_a for manual mma_cute
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
-        // Create a register tensor view over frag_a[k%2][i] (8 half_t = 1 FragA)
-        auto tCrA_i = make_tensor(
-          make_rmem_ptr(reinterpret_cast<cute::half_t*>(&frag_a[k % 2][i])),
-          shape(tCsA(_, _0{}, _0{}))  // same shape as MMA mode: (MMA=8)
-        );
-        copy(tCsA(_, i, k_subtile), tCrA_i);
+        auto frag_view = tCrA_mma(_, i, k_subtile);  // 8 half_t for this m_block
+        frag_a[k % 2][i] = *reinterpret_cast<FragA*>(&frag_view(0));
       }
     }
 
