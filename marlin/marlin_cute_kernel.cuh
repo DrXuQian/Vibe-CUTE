@@ -285,19 +285,44 @@ __global__ void MarlinCute(
   int s_gl_rd_delta = s_gl_stride;
 
   // ========================================================================
+  // CuTe Swizzled Layout for A Shared Memory
+  // ========================================================================
+
+  // The original swizzle: transform_a(i) = i ^ (i >> log2(a_sh_stride))
+  // CuTe equivalent: Swizzle<B, 0, B> where B = log2(a_sh_stride)
+  //   - CuTe requires abs(SShift) >= BBits, so B = shift
+  //   - For k_blocks=8 (stride=16): Swizzle<4, 0, 4> — XOR bits[0:3] with bits[4:7]
+  //   - For k_blocks=4 (stride=8):  Swizzle<3, 0, 3> — XOR bits[0:2] with bits[3:5]
+  //   - Sufficient for bank conflict avoidance; reads/writes use same layout
+  constexpr int A_TILE_M = 16 * thread_m_blocks;
+  constexpr int A_TILE_K = a_sh_stride;   // = 16 * thread_k_blocks / 8
+  constexpr int A_SH_BITS = (A_TILE_K == 16) ? 4 : 3;  // log2(a_sh_stride) = BBits = SShift
+  constexpr int A_M_THREADS = threads / A_TILE_K;  // threads per M dimension
+
+  // CuTe swizzled smem layout for one stage of A: (A_TILE_M, A_TILE_K) int4 elements
+  using SmemLayoutA = decltype(composition(
+    Swizzle<A_SH_BITS, 0, A_SH_BITS>{},
+    make_layout(make_shape(Int<A_TILE_M>{}, Int<A_TILE_K>{}),
+                make_stride(Int<A_TILE_K>{}, Int<1>{}))
+  ));
+
+  // ========================================================================
   // Per-Thread Index Computation
   // ========================================================================
 
-  // A matrix: global read index
-  int a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+  // A matrix: per-thread 2D coordinates for gmem->smem copy
+  int a_tid_m = threadIdx.x / A_TILE_K;   // thread's row assignment
+  int a_tid_k = threadIdx.x % A_TILE_K;   // thread's col assignment
+
+  // A matrix: global read base offset (flat, for the K dimension)
+  int a_gl_rd = a_gl_stride * a_tid_m + a_tid_k;
   a_gl_rd += a_gl_rd_delta_o * slice_row;
 
-  // A matrix: shared memory write index
-  int a_sh_wr = a_sh_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
-
-  // A matrix: shared memory read index (for ldmatrix)
-  int a_sh_rd = a_sh_stride * ((threadIdx.x % 32) % 16) + (threadIdx.x % 32) / 16;
-  a_sh_rd += 2 * ((threadIdx.x / 32) / (thread_n_blocks / 4));
+  // A matrix: shared memory read coordinates (for ldmatrix)
+  // Each warp reads a 16x16 block; lane determines row, lane/16 gives col offset
+  int a_rd_row_base = (threadIdx.x % 32) % 16;
+  int a_rd_col_base = (threadIdx.x % 32) / 16
+                    + 2 * ((threadIdx.x / 32) / (thread_n_blocks / 4));
 
   // B matrix indices
   int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride) + (threadIdx.x % b_sh_stride);
@@ -319,43 +344,12 @@ __global__ void MarlinCute(
   // Predication
   // ========================================================================
 
+  // A write predicate: check if this thread's row is within prob_m
   bool a_sh_wr_pred[a_sh_wr_iters];
   #pragma unroll
   for (int i = 0; i < a_sh_wr_iters; i++)
-    a_sh_wr_pred[i] = a_sh_wr_delta * i + a_sh_wr < a_sh_stride * prob_m;
+    a_sh_wr_pred[i] = a_tid_m + i * A_M_THREADS < prob_m;
   bool s_sh_wr_pred = threadIdx.x < s_sh_stride;
-
-  // ========================================================================
-  // Swizzle for A shared memory (XOR-based bank conflict avoidance)
-  // ========================================================================
-
-  // CuTe Swizzle: we use composition of Swizzle with the base layout.
-  // The original swizzle: transform_a(i) = stride*row + (col ^ row)
-  // where row = i / stride, col = i % stride.
-  // This is equivalent to XORing the low bits of col with row bits.
-  // For k_blocks=8 (stride=16): Swizzle<4,0,4> - XOR bits[0:3] with bits[4:7]
-  // For k_blocks=4 (stride=8):  Swizzle<3,0,3> - XOR bits[0:2] with bits[3:5]
-  //
-  // We use the original manual approach here for maximum compatibility across
-  // all thread_m_blocks configurations, since the original XOR pattern
-  // (idx ^ row) affects different bit ranges depending on m_blocks.
-  auto transform_a = [&] (int i) {
-    int row = i / a_gl_rd_delta_o;
-    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ row;
-  };
-
-  int a_sh_wr_trans[a_sh_wr_iters];
-  #pragma unroll
-  for (int i = 0; i < a_sh_wr_iters; i++)
-    a_sh_wr_trans[i] = transform_a(a_sh_wr_delta * i + a_sh_wr);
-
-  int a_sh_rd_trans[b_sh_wr_iters][thread_m_blocks];
-  #pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; i++) {
-    #pragma unroll
-    for (int j = 0; j < thread_m_blocks; j++)
-      a_sh_rd_trans[i][j] = transform_a(a_sh_rd_delta_o * i + a_sh_rd_delta_i * j + a_sh_rd);
-  }
 
   // ========================================================================
   // B pointers (multiple to break dependency chains)
@@ -401,11 +395,16 @@ __global__ void MarlinCute(
   auto fetch_to_shared = [&] (int pipe, int a_off, bool pred = true) {
     if (pred) {
       // --- A matrix: GMEM -> SMEM via cp.async ---
-      int4* sh_a_stage = sh_a + a_sh_stage * pipe;
+      // Use CuTe SmemLayoutA (with Swizzle) to compute destination addresses
+      auto sA_stage = make_tensor(
+        make_smem_ptr(sh_a + a_sh_stage * pipe),
+        SmemLayoutA{}
+      );
       #pragma unroll
       for (int i = 0; i < a_sh_wr_iters; i++) {
+        int row = a_tid_m + i * A_M_THREADS;
         cp_async4_pred_cute(
-          &sh_a_stage[a_sh_wr_trans[i]],
+          &sA_stage(row, a_tid_k),
           &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
           a_sh_wr_pred[i]
         );
@@ -454,11 +453,17 @@ __global__ void MarlinCute(
       reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
     }
 
-    // A: ldmatrix from swizzled shared memory
-    int4* sh_a_stage = sh_a + a_sh_stage * pipe;
+    // A: ldmatrix from CuTe-swizzled shared memory
+    auto sA_stage = make_tensor(
+      make_smem_ptr(sh_a + a_sh_stage * pipe),
+      SmemLayoutA{}
+    );
     #pragma unroll
-    for (int i = 0; i < thread_m_blocks; i++)
-      ldsm4_cute(frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
+    for (int i = 0; i < thread_m_blocks; i++) {
+      int a_rd_row = a_rd_row_base + i * 16;
+      int a_rd_col = a_rd_col_base + a_sh_rd_delta_o * (k % b_sh_wr_iters);
+      ldsm4_cute(frag_a[k % 2][i], &sA_stage(a_rd_row, a_rd_col));
+    }
 
     // B: direct load of packed INT4 from shared memory
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
