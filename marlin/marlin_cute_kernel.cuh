@@ -189,7 +189,9 @@ __global__ void MarlinCute(
   int* locks
 ) {
   // ========================================================================
-  // CTA Dispatcher (unchanged from original Marlin)
+  // CTA Dispatcher
+  // Uses immutable base pointers + par_m_idx offset instead of mutating
+  // A/C/locks pointers directly.
   // ========================================================================
   int parallel = 1;
   if (prob_m > 16 * thread_m_blocks) {
@@ -210,12 +212,18 @@ __global__ void MarlinCute(
   int slice_count = 0;
   int slice_idx;
 
+  // Track M-parallel offset via index instead of pointer mutation
+  // par_m_idx counts how many (16 * thread_m_blocks) M-blocks we've advanced
+  int par_m_idx = 0;
   if (slice_col_par >= n_tiles) {
-    A += (slice_col_par / n_tiles) * 16 * thread_m_blocks * prob_k / 8;
-    C += (slice_col_par / n_tiles) * 16 * thread_m_blocks * prob_n / 8;
-    locks += (slice_col_par / n_tiles) * n_tiles;
+    par_m_idx = slice_col_par / n_tiles;
     slice_col = slice_col_par % n_tiles;
   }
+
+  // Compute current A/C/locks from immutable base + par_m_idx
+  auto cur_A = [&]() -> const int4* { return A + par_m_idx * 16 * thread_m_blocks * prob_k / 8; };
+  auto cur_C = [&]() -> int4* { return C + par_m_idx * 16 * thread_m_blocks * prob_n / 8; };
+  auto cur_locks = [&]() -> int* { return locks + par_m_idx * n_tiles; };
 
   auto init_slice = [&] () {
     slice_iters = iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
@@ -243,9 +251,7 @@ __global__ void MarlinCute(
       }
     }
     if (slice_col == n_tiles) {
-      A += 16 * thread_m_blocks * prob_k / 8;
-      C += 16 * thread_m_blocks * prob_n / 8;
-      locks += n_tiles;
+      par_m_idx++;  // advance to next M-parallel block
       slice_col = 0;
     }
   };
@@ -410,7 +416,7 @@ __global__ void MarlinCute(
       // --- A matrix: GMEM -> SMEM via CuTe TiledCopy ---
       // Create gmem tensor for this K-tile (half_t elements)
       auto gA_tile = make_tensor(
-        make_gmem_ptr(reinterpret_cast<const cute::half_t*>(A) + a_k_col + A_TILE_K_HALF * a_off),
+        make_gmem_ptr(reinterpret_cast<const cute::half_t*>(cur_A()) + a_k_col + A_TILE_K_HALF * a_off),
         make_shape(Int<A_TILE_M>{}, Int<A_TILE_K_HALF>{}),
         make_stride(prob_k, Int<1>{})
       );
@@ -606,13 +612,14 @@ __global__ void MarlinCute(
       int c_sh_wr = threadIdx.x;
 
       int row = (threadIdx.x % 32) / 4;
+      int4* C_cur = cur_C();
 
       if (!first) {
         #pragma unroll
         for (int i = 0; i < thread_m_blocks * 4; i++) {
           cp_async4_pred_cute(
             &sh[c_sh_wr + c_sh_wr_delta * i],
-            &C[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)],
+            &C_cur[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)],
             i < (thread_m_blocks - 1) * 4 || 8 * (i / 2) + row < prob_m
           );
         }
@@ -640,7 +647,7 @@ __global__ void MarlinCute(
                 reinterpret_cast<float*>(&frag_c)[4 * 2 * 4 * (i / 4) + 4 * j + (i % 4)]
               );
             }
-            C[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)] = c;
+            C_cur[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)] = c;
           }
         }
       }
@@ -691,10 +698,11 @@ __global__ void MarlinCute(
     __syncthreads();
 
     // Stage 2: Stream shared -> global C
+    int4* C_cur = cur_C();
     #pragma unroll
     for (int i = 0; i < ceildiv_cute(16 * thread_m_blocks, threads / (2 * thread_n_blocks)); i++) {
       if (c_gl_wr < c_gl_wr_end) {
-        C[c_gl_wr] = sh[c_sh_rd];
+        C_cur[c_gl_wr] = sh[c_sh_rd];
         c_gl_wr += c_gl_wr_delta;
         c_sh_rd += c_sh_rd_delta;
       }
@@ -763,9 +771,9 @@ __global__ void MarlinCute(
       }
 
       if (slice_count > 1) {
-        barrier_acquire_cute(&locks[slice_col], slice_idx);
+        barrier_acquire_cute(&cur_locks()[slice_col], slice_idx);
         global_reduce(slice_idx == 0, last);
-        barrier_release_cute(&locks[slice_col], last);
+        barrier_release_cute(&cur_locks()[slice_col], last);
       }
       if (last)
         write_result();
