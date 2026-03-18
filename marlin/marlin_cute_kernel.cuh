@@ -72,20 +72,6 @@ __device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
   );
 }
 
-// m16n8k16 MMA (kept manual for dequant-MMA interleaving)
-__device__ inline void mma_m16n8k16(const FragA& a_frag, const FragB& frag_b, FragC& frag_c) {
-  const uint32_t* a = reinterpret_cast<const uint32_t*>(&a_frag);
-  const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
-  float* c = reinterpret_cast<float*>(&frag_c);
-  asm volatile(
-    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-    : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
-    :  "r"(a[0]),  "r"(a[1]),  "r"(a[2]),  "r"(a[3]),  "r"(b[0]),  "r"(b[1]),
-       "f"(c[0]),  "f"(c[1]),  "f"(c[2]),  "f"(c[3])
-  );
-}
-
 // lop3: 3-input logical operation (used by INT4 dequantization)
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
@@ -390,7 +376,12 @@ __global__ void MarlinCute(
   // Register Fragments
   // ========================================================================
 
-  FragA frag_a[2][thread_m_blocks];           // A fragments (double-buffered over k)
+  // A fragments: CuTe register tensors (double-buffered), allocated once
+  // Shape: (MMA=8 half_t, MMA_M=m_blocks, MMA_K=b_sh_wr_iters)
+  auto sA_dummy = make_tensor(make_smem_ptr((cute::half_t*)nullptr), SmemLayoutA{});
+  auto tCrA_buf0 = thr_mma.partition_fragment_A(sA_dummy);
+  auto tCrA_buf1 = thr_mma.partition_fragment_A(sA_dummy);
+
   I4    frag_b_quant[2];                      // packed INT4 B fragments (double-buffered)
   FragC frag_c[thread_m_blocks][4][2];        // accumulators [m_block][n_subtile][b_half]
   FragS frag_s[2][4];                         // scale fragments (double-buffered)
@@ -426,11 +417,14 @@ __global__ void MarlinCute(
       // Partition source and destination for this thread
       auto tAgA = gmem_thr_copy_a.partition_S(gA_tile);  // (CPY, CPY_M, CPY_K)
       auto tAsA = gmem_thr_copy_a.partition_D(sA_stage); // (CPY, CPY_M, CPY_K)
-      // Copy with predication (iterate over M-partitions)
+      // Copy with M-bounds predication via CuTe copy
       #pragma unroll
-      for (int i = 0; i < size<1>(tAsA); i++) {
-        bool m_pred = (a_tid_m + i * A_M_THREADS) < prob_m;
-        marlin_cute::cp_async4_pred(&tAsA(_0{}, i, _0{}), &tAgA(_0{}, i, _0{}), m_pred);
+      for (int m = 0; m < size<1>(tAsA); m++) {
+        if ((a_tid_m + m * A_M_THREADS) < prob_m) {
+          #pragma unroll
+          for (int k = 0; k < size<2>(tAsA); k++)
+            copy(gmem_tiled_copy_a, tAgA(_, m, k), tAsA(_, m, k));
+        }
       }
 
       // --- B matrix: GMEM -> SMEM via CuTe TiledCopy ---
@@ -487,30 +481,17 @@ __global__ void MarlinCute(
     }
 
     // A: smem -> reg via make_tiled_copy_A + retile_D (ldmatrix)
-    // Standard CuTe pattern: smem_thr_copy_a.partition_S for smem source,
-    // retile_D to bridge MMA fragment layout with ldmatrix dest layout.
+    // Loads directly into persistent tCrA buffers (no intermediate copy)
     {
       auto sA_stage = make_tensor(
         make_smem_ptr(reinterpret_cast<cute::half_t*>(sh_a + a_sh_stage * pipe)),
         SmemLayoutA{}
       );
-      // Partition smem for ldmatrix copy
-      auto tCsA = smem_thr_copy_a.partition_S(sA_stage);   // (CPY, CPY_M, CPY_K)
-
-      // Create MMA register fragment and retile for ldmatrix dest
-      auto tCrA_mma = thr_mma.partition_fragment_A(sA_stage); // (MMA, MMA_M, MMA_K)
-      auto tCrA_copy = smem_thr_copy_a.retile_D(tCrA_mma);   // (CPY, CPY_M, CPY_K)
-
+      auto tCsA = smem_thr_copy_a.partition_S(sA_stage);
+      auto& tCrA = (k % 2 == 0) ? tCrA_buf0 : tCrA_buf1;
+      auto tCrA_copy = smem_thr_copy_a.retile_D(tCrA);
       int k_subtile = k % b_sh_wr_iters;
-      // Copy smem -> reg using ldmatrix instruction
       copy(smem_tiled_copy_a, tCsA(_, _, k_subtile), tCrA_copy(_, _, k_subtile));
-
-      // Transfer from CuTe register tensor to frag_a for manual mma_m16n8k16
-      #pragma unroll
-      for (int i = 0; i < thread_m_blocks; i++) {
-        auto frag_view = tCrA_mma(_, i, k_subtile);  // 8 half_t for this m_block
-        frag_a[k % 2][i] = *reinterpret_cast<FragA*>(&frag_view(0));
-      }
     }
 
     // B: direct load of packed INT4 from shared memory
@@ -524,6 +505,8 @@ __global__ void MarlinCute(
   // ========================================================================
 
   auto matmul = [&] (int k) {
+    auto& tCrA = (k % 2 == 0) ? tCrA_buf0 : tCrA_buf1;
+    int k_subtile = k % b_sh_wr_iters;
     #pragma unroll
     for (int j = 0; j < 4; j++) {
       // Dequantize INT4 -> FP16
@@ -536,11 +519,22 @@ __global__ void MarlinCute(
       if (group_blocks != -1)
         marlin_cute::scale_frag(frag_b1, frag_s[k % 2][j], 1);
 
-      // MMA: iterate over M blocks
+      // MMA: iterate over M blocks, using CuTe A fragments + SM80 fma
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
-        marlin_cute::mma_m16n8k16(frag_a[k % 2][i], frag_b0, frag_c[i][j][0]);
-        marlin_cute::mma_m16n8k16(frag_a[k % 2][i], frag_b1, frag_c[i][j][1]);
+        const uint32_t* a = reinterpret_cast<const uint32_t*>(&tCrA(0, i, k_subtile));
+        const uint32_t* b0 = reinterpret_cast<const uint32_t*>(&frag_b0);
+        const uint32_t* b1 = reinterpret_cast<const uint32_t*>(&frag_b1);
+        float* c0 = frag_c[i][j][0].elems;
+        float* c1 = frag_c[i][j][1].elems;
+        cute::SM80_16x8x16_F32F16F16F32_TN::fma(
+          c0[0], c0[1], c0[2], c0[3],
+          a[0], a[1], a[2], a[3],  b0[0], b0[1],
+          c0[0], c0[1], c0[2], c0[3]);
+        cute::SM80_16x8x16_F32F16F16F32_TN::fma(
+          c1[0], c1[1], c1[2], c1[3],
+          a[0], a[1], a[2], a[3],  b1[0], b1[1],
+          c1[0], c1[1], c1[2], c1[3]);
       }
     }
   };
