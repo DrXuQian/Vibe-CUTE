@@ -42,11 +42,14 @@ constexpr int ceildiv_cute(int a, int b) {
 }
 
 // ============================================================================
-// PTX Intrinsics (unchanged from original Marlin)
+// PTX Intrinsics — manual PTX for operations without CuTe high-level API
+// Placed in namespace to avoid conflicts with original Marlin kernel.
 // ============================================================================
 
-// Predicated cp.async: global -> shared (cache at all levels)
-__device__ inline void cp_async4_pred_cute(void* smem_ptr, const void* glob_ptr, bool pred = true) {
+namespace marlin_cute {
+
+// Predicated cp.async 16B: global -> shared (used for A with M-bounds check)
+__device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool pred = true) {
   const int BYTES = 16;
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
@@ -58,8 +61,8 @@ __device__ inline void cp_async4_pred_cute(void* smem_ptr, const void* glob_ptr,
   );
 }
 
-// cp.async with cache-global hint (for weights B, accessed only once)
-__device__ inline void cp_async4_stream_cute(void* smem_ptr, const void* glob_ptr) {
+// cp.async 16B with cache-global hint (used for scales S)
+__device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
   const int BYTES = 16;
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
@@ -69,17 +72,8 @@ __device__ inline void cp_async4_stream_cute(void* smem_ptr, const void* glob_pt
   );
 }
 
-__device__ inline void cp_async_fence_cute() {
-  asm volatile("cp.async.commit_group;\n" ::);
-}
-
-template <int n>
-__device__ inline void cp_async_wait_cute() {
-  asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
-}
-
-// m16n8k16 MMA instruction
-__device__ inline void mma_cute(const FragA& a_frag, const FragB& frag_b, FragC& frag_c) {
+// m16n8k16 MMA (kept manual for dequant-MMA interleaving)
+__device__ inline void mma_m16n8k16(const FragA& a_frag, const FragB& frag_b, FragC& frag_c) {
   const uint32_t* a = reinterpret_cast<const uint32_t*>(&a_frag);
   const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
   float* c = reinterpret_cast<float*>(&frag_c);
@@ -92,19 +86,9 @@ __device__ inline void mma_cute(const FragA& a_frag, const FragB& frag_b, FragC&
   );
 }
 
-// ldmatrix: load 4x m8n8 matrix fragments from shared memory
-__device__ inline void ldsm4_cute(FragA& frag_a, const void* smem_ptr) {
-  uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
-  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-    : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
-  );
-}
-
-// lop3: 3-input logical operation
+// lop3: 3-input logical operation (used by INT4 dequantization)
 template <int lut>
-__device__ inline int lop3_cute(int a, int b, int c) {
+__device__ inline int lop3(int a, int b, int c) {
   int res;
   asm volatile(
     "lop3.b32 %0, %1, %2, %3, %4;\n"
@@ -114,12 +98,12 @@ __device__ inline int lop3_cute(int a, int b, int c) {
 }
 
 // INT4 dequantization: int32 -> 4x FP16 (FragB)
-__device__ inline FragB dequant_cute(int q) {
+__device__ inline FragB dequant_4bit(int q) {
   const int LO = 0x000f000f;
   const int HI = 0x00f000f0;
   const int EX = 0x64006400;
-  int lo = lop3_cute<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
-  int hi = lop3_cute<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
   const int SUB = 0x64086408;
   const int MUL = 0x2c002c00;
   const int ADD = 0xd480d480;
@@ -136,14 +120,14 @@ __device__ inline FragB dequant_cute(int q) {
 }
 
 // Scale a B fragment by quantization scale
-__device__ inline void scale_cute(FragB& frag_b, FragS& frag_s, int i) {
+__device__ inline void scale_frag(FragB& frag_b, FragS& frag_s, int i) {
   half2 s = __half2half2(reinterpret_cast<__half*>(&frag_s)[i]);
   frag_b[0] = __hmul2(frag_b[0], s);
   frag_b[1] = __hmul2(frag_b[1], s);
 }
 
-// Cross-CTA synchronization barriers
-__device__ inline void barrier_acquire_cute(int* lock, int count) {
+// Cross-CTA synchronization barriers (Marlin-specific)
+__device__ inline void barrier_acquire(int* lock, int count) {
   if (threadIdx.x == 0) {
     int state = -1;
     do
@@ -153,7 +137,7 @@ __device__ inline void barrier_acquire_cute(int* lock, int count) {
   __syncthreads();
 }
 
-__device__ inline void barrier_release_cute(int* lock, bool reset = false) {
+__device__ inline void barrier_release(int* lock, bool reset = false) {
   __syncthreads();
   if (threadIdx.x == 0) {
     if (reset) {
@@ -165,6 +149,8 @@ __device__ inline void barrier_release_cute(int* lock, bool reset = false) {
     asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val));
   }
 }
+
+} // namespace marlin_cute
 
 // ============================================================================
 // Main CuTe-based Marlin Kernel
@@ -444,7 +430,7 @@ __global__ void MarlinCute(
       #pragma unroll
       for (int i = 0; i < size<1>(tAsA); i++) {
         bool m_pred = (a_tid_m + i * A_M_THREADS) < prob_m;
-        cp_async4_pred_cute(&tAsA(_0{}, i, _0{}), &tAgA(_0{}, i, _0{}), m_pred);
+        marlin_cute::cp_async4_pred(&tAsA(_0{}, i, _0{}), &tAgA(_0{}, i, _0{}), m_pred);
       }
 
       // --- B matrix: GMEM -> SMEM via CuTe TiledCopy ---
@@ -460,11 +446,8 @@ __global__ void MarlinCute(
         );
         auto tBgB = gmem_thr_copy_b.partition_S(gB_tile);
         auto tBsB = gmem_thr_copy_b.partition_D(sB_stage);
-        // No predication needed for B (tile always fully valid)
-        #pragma unroll
-        for (int i = 0; i < size<1>(tBsB); i++) {
-          cp_async4_stream_cute(&tBsB(_0{}, i, _0{}), &tBgB(_0{}, i, _0{}));
-        }
+        // No predication needed for B — use CuTe copy directly (cp.async.cg)
+        copy(gmem_tiled_copy_b, tBgB, tBsB);
         b_k_row += thread_k_blocks;  // advance to next K-tile
       }
 
@@ -473,12 +456,12 @@ __global__ void MarlinCute(
         if (pipe % (group_blocks / thread_k_blocks) == 0) {
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
           if (s_sh_wr_pred)
-            cp_async4_stream_cute(&sh_s_stage[s_sh_wr], &s[s_gl_rd]);
+            marlin_cute::cp_async4_stream(&sh_s_stage[s_sh_wr], &s[s_gl_rd]);
           s_gl_rd += s_gl_rd_delta;
         }
       }
     }
-    cp_async_fence_cute();
+    cute::cp_async_fence();
   };
 
   // ========================================================================
@@ -486,7 +469,7 @@ __global__ void MarlinCute(
   // ========================================================================
 
   auto wait_for_stage = [&] () {
-    cp_async_wait_cute<stages - 2>();
+    cute::cp_async_wait<stages - 2>();
     __syncthreads();
   };
 
@@ -522,7 +505,7 @@ __global__ void MarlinCute(
       // Copy smem -> reg using ldmatrix instruction
       copy(smem_tiled_copy_a, tCsA(_, _, k_subtile), tCrA_copy(_, _, k_subtile));
 
-      // Transfer from CuTe register tensor to frag_a for manual mma_cute
+      // Transfer from CuTe register tensor to frag_a for manual mma_m16n8k16
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
         auto frag_view = tCrA_mma(_, i, k_subtile);  // 8 half_t for this m_block
@@ -546,18 +529,18 @@ __global__ void MarlinCute(
       // Dequantize INT4 -> FP16
       int b_quant = frag_b_quant[k % 2][j];
       int b_quant_shift = b_quant >> 8;
-      FragB frag_b0 = dequant_cute(b_quant);
+      FragB frag_b0 = marlin_cute::dequant_4bit(b_quant);
       if (group_blocks != -1)
-        scale_cute(frag_b0, frag_s[k % 2][j], 0);
-      FragB frag_b1 = dequant_cute(b_quant_shift);
+        marlin_cute::scale_frag(frag_b0, frag_s[k % 2][j], 0);
+      FragB frag_b1 = marlin_cute::dequant_4bit(b_quant_shift);
       if (group_blocks != -1)
-        scale_cute(frag_b1, frag_s[k % 2][j], 1);
+        marlin_cute::scale_frag(frag_b1, frag_s[k % 2][j], 1);
 
       // MMA: iterate over M blocks
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
-        mma_cute(frag_a[k % 2][i], frag_b0, frag_c[i][j][0]);
-        mma_cute(frag_a[k % 2][i], frag_b1, frag_c[i][j][1]);
+        marlin_cute::mma_m16n8k16(frag_a[k % 2][i], frag_b0, frag_c[i][j][0]);
+        marlin_cute::mma_m16n8k16(frag_a[k % 2][i], frag_b1, frag_c[i][j][1]);
       }
     }
   };
@@ -629,14 +612,14 @@ __global__ void MarlinCute(
       if (!first) {
         #pragma unroll
         for (int i = 0; i < thread_m_blocks * 4; i++) {
-          cp_async4_pred_cute(
+          marlin_cute::cp_async4_pred(
             &sh[c_sh_wr + c_sh_wr_delta * i],
             &C_cur[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)],
             i < (thread_m_blocks - 1) * 4 || 8 * (i / 2) + row < prob_m
           );
         }
-        cp_async_fence_cute();
-        cp_async_wait_cute<0>();
+        cute::cp_async_fence();
+        cute::cp_async_wait<0>();
       }
 
       #pragma unroll
@@ -761,20 +744,20 @@ __global__ void MarlinCute(
 
     // Post-processing: reduce and possibly move to next column slice
     if (slice_iters == 0) {
-      cp_async_wait_cute<0>();
+      cute::cp_async_wait<0>();
       bool last = slice_idx == slice_count - 1;
 
       // Per-column scales: fetch in the final step before write-out
       if (group_blocks == -1 && last) {
         if (s_sh_wr_pred)
-          cp_async4_stream_cute(&sh_s[s_sh_wr], &s[s_gl_rd]);
-        cp_async_fence_cute();
+          marlin_cute::cp_async4_stream(&sh_s[s_sh_wr], &s[s_gl_rd]);
+        cute::cp_async_fence();
       }
 
       thread_block_reduce();
 
       if (group_blocks == -1 && last) {
-        cp_async_wait_cute<0>();
+        cute::cp_async_wait<0>();
         __syncthreads();
         if (threadIdx.x / 32 < thread_n_blocks / 4) {
           reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd + 0];
@@ -783,9 +766,9 @@ __global__ void MarlinCute(
       }
 
       if (slice_count > 1) {
-        barrier_acquire_cute(&cur_locks()[slice_col], slice_idx);
+        marlin_cute::barrier_acquire(&cur_locks()[slice_col], slice_idx);
         global_reduce(slice_idx == 0, last);
-        barrier_release_cute(&cur_locks()[slice_col], last);
+        marlin_cute::barrier_release(&cur_locks()[slice_col], last);
       }
       if (last)
         write_result();
