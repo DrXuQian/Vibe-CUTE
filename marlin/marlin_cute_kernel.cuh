@@ -563,26 +563,34 @@ __global__ void MarlinCute(
   // Lambda: Global reduction across CTAs (serial in L2)
   // ========================================================================
 
+  // Global reduce smem layout: (thread_m_blocks*4, active_threads) in int4
+  // Each thread stores/loads one int4 (8 fp16) per M-iteration
+  constexpr int GR_ACTIVE_THREADS = 32 * thread_n_blocks / 4;
+
   auto global_reduce = [&] (bool first = false, bool last = false) {
-    constexpr int active_threads = 32 * thread_n_blocks / 4;
-    if (threadIdx.x < active_threads) {
+    if (threadIdx.x < GR_ACTIVE_THREADS) {
       int c_gl_stride = prob_n / 8;
       int c_gl_wr_delta_o = 8 * c_gl_stride;
-      int c_gl_wr_delta_i = 4 * (active_threads / 32);
+      int c_gl_wr_delta_i = 4 * (GR_ACTIVE_THREADS / 32);
       int c_gl_wr = c_gl_stride * ((threadIdx.x % 32) / 4) + 4 * (threadIdx.x / 32) + threadIdx.x % 4;
       c_gl_wr += (2 * thread_n_blocks) * tile_work.n_idx;
-      constexpr int c_sh_wr_delta = active_threads;
-      int c_sh_wr = threadIdx.x;
-
       int row = (threadIdx.x % 32) / 4;
       int4* C_cur = cur_C();
 
+      // Smem for partial sums: flat, each thread has stride=active_threads
+      auto sC_reduce = make_tensor(
+        make_smem_ptr(sh + threadIdx.x),
+        make_shape(Int<thread_m_blocks * 4>{}),
+        make_stride(Int<GR_ACTIVE_THREADS>{})
+      );
+
       if (!first) {
+        // Load C partial sums from gmem to smem via cp.async
         #pragma unroll
         for (int i = 0; i < thread_m_blocks * 4; i++) {
           if (i < (thread_m_blocks - 1) * 4 || 8 * (i / 2) + row < prob_m) {
             auto src = make_tensor(make_gmem_ptr(&C_cur[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)]), Int<1>{});
-            auto dst = make_tensor(make_smem_ptr(&sh[c_sh_wr + c_sh_wr_delta * i]), Int<1>{});
+            auto dst = make_tensor(make_smem_ptr(&sC_reduce(i)), Int<1>{});
             copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, int4>{}, src, dst);
           }
         }
@@ -593,21 +601,19 @@ __global__ void MarlinCute(
       #pragma unroll
       for (int i = 0; i < thread_m_blocks * 4; i++) {
         if (i < (thread_m_blocks - 1) * 4 || 8 * (i / 2) + row < prob_m) {
+          // Accumulate from smem partial sum
           if (!first) {
-            int4 c_red = sh[c_sh_wr + i * c_sh_wr_delta];
+            int4 c_red = sC_reduce(i);
             #pragma unroll
-            for (int j = 0; j < 2 * 4; j++) {
-              tCrC(i % 4, i / 4, j) += __half2float(
-                reinterpret_cast<__half*>(&c_red)[j]
-              );
-            }
+            for (int j = 0; j < 2 * 4; j++)
+              tCrC(i % 4, i / 4, j) += __half2float(reinterpret_cast<__half*>(&c_red)[j]);
           }
+          // Write current partial sum to gmem
           if (!last) {
             int4 c;
             #pragma unroll
-            for (int j = 0; j < 2 * 4; j++) {
+            for (int j = 0; j < 2 * 4; j++)
               reinterpret_cast<__half*>(&c)[j] = __float2half(tCrC(i % 4, i / 4, j));
-            }
             C_cur[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)] = c;
           }
         }
@@ -619,21 +625,33 @@ __global__ void MarlinCute(
   // Lambda: Write final result to global C
   // ========================================================================
 
-  auto write_result = [&] () {
-    int c_gl_stride = prob_n / 8;
-    constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
-    int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));
-    constexpr int c_sh_rd_delta = c_sh_stride * (threads / (2 * thread_n_blocks));
+  // Epilog smem layout for C: (M, N) in int4 with +1 padding to avoid bank conflicts
+  // Same as original c_sh_stride = 2 * thread_n_blocks + 1
+  constexpr int C_SH_N = 2 * thread_n_blocks;     // N-tiles in int4
+  constexpr int C_SH_STRIDE = C_SH_N + 1;         // padded stride
+  using SmemLayoutC = decltype(make_layout(
+    make_shape(Int<16 * thread_m_blocks>{}, Int<C_SH_N>{}),
+    make_stride(Int<C_SH_STRIDE>{}, _1{})
+  ));
 
-    int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * thread_n_blocks)) + (threadIdx.x % (2 * thread_n_blocks));
-    c_gl_wr += (2 * thread_n_blocks) * tile_work.n_idx;
+  // S2G TiledCopy for C: 256 threads, each copies 1 int4 (8 fp16)
+  constexpr int C_S2G_N_THREADS = C_SH_N;
+  constexpr int C_S2G_M_THREADS = threads / C_S2G_N_THREADS;
+  using S2GCCopyAtom = Copy_Atom<UniversalCopy<cute::uint128_t>, int4>;
+  using S2GCCopy = decltype(make_tiled_copy(
+    S2GCCopyAtom{},
+    make_layout(make_shape(Int<C_S2G_M_THREADS>{}, Int<C_S2G_N_THREADS>{}),
+                make_stride(Int<C_S2G_N_THREADS>{}, _1{})),
+    Layout<Shape<_1, _1>>{}
+  ));
+
+  auto write_result = [&] () {
+    // Stage 1: Pack frag_c (FP32) -> shared memory (FP16) — manual MMA-specific shuffle
+    // Only active warps (those assigned to N) participate
+    constexpr int c_sh_stride = C_SH_STRIDE;
     int c_sh_wr = (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
     c_sh_wr += 32 * (threadIdx.x / 32);
-    int c_sh_rd = c_sh_stride * (threadIdx.x / (2 * thread_n_blocks)) + (threadIdx.x % (2 * thread_n_blocks));
 
-    int c_gl_wr_end = c_gl_stride * prob_m;
-
-    // Pack FP32 accumulator -> FP16 half2, optionally apply per-column scale
     auto write = [&] (int idx, float c0, float c1, FragS& s_frag) {
       half2 res = __halves2half2(__float2half(c0), __float2half(c1));
       if (group_blocks == -1)
@@ -641,7 +659,6 @@ __global__ void MarlinCute(
       ((half2*) sh)[idx] = res;
     };
 
-    // Stage 1: Pack frag_c -> shared memory (only active warps)
     if (threadIdx.x / 32 < thread_n_blocks / 4) {
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
@@ -658,14 +675,30 @@ __global__ void MarlinCute(
     }
     __syncthreads();
 
-    // Stage 2: Stream shared -> global C
+    // Stage 2: Stream shared -> global C via CuTe TiledCopy
+    auto sC = make_tensor(make_smem_ptr(sh), SmemLayoutC{});
+    // Global C tile for this CTA's output
     int4* C_cur = cur_C();
+    int c_gl_stride = prob_n / 8;
+    auto gC_tile = make_tensor(
+      make_gmem_ptr(C_cur + C_SH_N * tile_work.n_idx),
+      make_shape(Int<16 * thread_m_blocks>{}, Int<C_SH_N>{}),
+      make_stride(c_gl_stride, _1{})
+    );
+
+    S2GCCopy s2g_c_copy;
+    auto thr_s2g = s2g_c_copy.get_thread_slice(threadIdx.x);
+    auto tCsC = thr_s2g.partition_S(sC);
+    auto tCgC = thr_s2g.partition_D(gC_tile);
+    // Predication via identity tensor for M-bounds
+    auto gC_identity = make_identity_tensor(shape(gC_tile));
+    auto tCgC_id = thr_s2g.partition_D(gC_identity);
     #pragma unroll
-    for (int i = 0; i < ceildiv_cute(16 * thread_m_blocks, threads / (2 * thread_n_blocks)); i++) {
-      if (c_gl_wr < c_gl_wr_end) {
-        C_cur[c_gl_wr] = sh[c_sh_rd];
-        c_gl_wr += c_gl_wr_delta;
-        c_sh_rd += c_sh_rd_delta;
+    for (int m = 0; m < size<1>(tCgC); m++) {
+      if (get<0>(tCgC_id(_0{}, m, _0{})) < prob_m) {
+        #pragma unroll
+        for (int n = 0; n < size<2>(tCgC); n++)
+          copy(s2g_c_copy, tCsC(_, m, n), tCgC(_, m, n));
       }
     }
   };
