@@ -355,7 +355,13 @@ __global__ void MarlinCute(
   auto tCrA_buf1 = thr_mma.partition_fragment_A(sA_dummy);
 
   I4    frag_b_quant[2];                      // packed INT4 B fragments (double-buffered)
-  FragC frag_c[thread_m_blocks][4][2];        // accumulators [m_block][n_subtile][b_half]
+  // C accumulators: CuTe register tensor (4 float per MMA, m_blocks M, 8 N-subtiles)
+  // Layout: (v=4, m=m_blocks, n=8) with strides (1, 32, 4) to match original frag_c[m][4][2]
+  // Access: tCrC(v, m_block, j*2+b) ↔ old frag_c[m_block][j][b].elems[v]
+  auto tCrC = make_tensor<float>(
+    make_shape(_4{}, Int<thread_m_blocks>{}, _8{}),
+    make_stride(_1{}, Int<32>{}, _4{})
+  );
   FragS frag_s[2][4];                         // scale fragments (double-buffered)
 
   // ========================================================================
@@ -363,9 +369,7 @@ __global__ void MarlinCute(
   // ========================================================================
 
   auto zero_accums = [&] () {
-    #pragma unroll
-    for (int i = 0; i < thread_m_blocks * 4 * 2 * 4; i++)
-      reinterpret_cast<float*>(frag_c)[i] = 0;
+    clear(tCrC);
   };
 
   // ========================================================================
@@ -505,10 +509,8 @@ __global__ void MarlinCute(
       // MMA via CuTe gemm: C += A * B
       #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
-        auto c0 = make_tensor(make_rmem_ptr(frag_c[i][j][0].elems), Shape<_4>{});
-        auto c1 = make_tensor(make_rmem_ptr(frag_c[i][j][1].elems), Shape<_4>{});
-        gemm(mma_atom, tCrA(_, i, k_subtile), b0, c0);
-        gemm(mma_atom, tCrA(_, i, k_subtile), b1, c1);
+        gemm(mma_atom, tCrA(_, i, k_subtile), b0, tCrC(_, i, j * 2));
+        gemm(mma_atom, tCrA(_, i, k_subtile), b1, tCrC(_, i, j * 2 + 1));
       }
     }
   };
@@ -538,9 +540,9 @@ __global__ void MarlinCute(
                 float* c_wr = reinterpret_cast<float*>(&sh[red_sh_wr]);
                 #pragma unroll
                 for (int k = 0; k < 4; k++)
-                  reinterpret_cast<FragC*>(frag_c)[4 * 2 * m_block + j][k] += c_rd[k] + c_wr[k];
+                  tCrC(k, m_block, j) += c_rd[k] + c_wr[k];
               }
-              sh[red_sh_wr] = reinterpret_cast<int4*>(&frag_c)[4 * 2 * m_block + j];
+              sh[red_sh_wr] = *reinterpret_cast<const int4*>(&tCrC(0, m_block, j));
             }
           }
           __syncthreads();
@@ -551,7 +553,7 @@ __global__ void MarlinCute(
             float* c_rd = reinterpret_cast<float*>(&sh[red_sh_delta * i + red_sh_rd]);
             #pragma unroll
             for (int j = 0; j < 4; j++)
-              reinterpret_cast<FragC*>(frag_c)[4 * 2 * m_block + i][j] += c_rd[j];
+              tCrC(j, m_block, i) += c_rd[j];
           }
         }
         __syncthreads();
@@ -597,7 +599,7 @@ __global__ void MarlinCute(
             int4 c_red = sh[c_sh_wr + i * c_sh_wr_delta];
             #pragma unroll
             for (int j = 0; j < 2 * 4; j++) {
-              reinterpret_cast<float*>(&frag_c)[4 * 2 * 4 * (i / 4) + 4 * j + (i % 4)] += __half2float(
+              tCrC(i % 4, i / 4, j) += __half2float(
                 reinterpret_cast<__half*>(&c_red)[j]
               );
             }
@@ -606,9 +608,7 @@ __global__ void MarlinCute(
             int4 c;
             #pragma unroll
             for (int j = 0; j < 2 * 4; j++) {
-              reinterpret_cast<__half*>(&c)[j] = __float2half(
-                reinterpret_cast<float*>(&frag_c)[4 * 2 * 4 * (i / 4) + 4 * j + (i % 4)]
-              );
+              reinterpret_cast<__half*>(&c)[j] = __float2half(tCrC(i % 4, i / 4, j));
             }
             C_cur[c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2)] = c;
           }
@@ -650,10 +650,10 @@ __global__ void MarlinCute(
         #pragma unroll
         for (int j = 0; j < 4; j++) {
           int wr = c_sh_wr + 8 * j;
-          write(wr + (4 * c_sh_stride) * 0 + 0, frag_c[i][j][0][0], frag_c[i][j][0][1], frag_s[j / 2][2 * (j % 2) + 0]);
-          write(wr + (4 * c_sh_stride) * 8 + 0, frag_c[i][j][0][2], frag_c[i][j][0][3], frag_s[j / 2][2 * (j % 2) + 0]);
-          write(wr + (4 * c_sh_stride) * 0 + 4, frag_c[i][j][1][0], frag_c[i][j][1][1], frag_s[j / 2][2 * (j % 2) + 1]);
-          write(wr + (4 * c_sh_stride) * 8 + 4, frag_c[i][j][1][2], frag_c[i][j][1][3], frag_s[j / 2][2 * (j % 2) + 1]);
+          write(wr + (4 * c_sh_stride) * 0 + 0, tCrC(0, i, j*2), tCrC(1, i, j*2), frag_s[j / 2][2 * (j % 2) + 0]);
+          write(wr + (4 * c_sh_stride) * 8 + 0, tCrC(2, i, j*2), tCrC(3, i, j*2), frag_s[j / 2][2 * (j % 2) + 0]);
+          write(wr + (4 * c_sh_stride) * 0 + 4, tCrC(0, i, j*2+1), tCrC(1, i, j*2+1), frag_s[j / 2][2 * (j % 2) + 1]);
+          write(wr + (4 * c_sh_stride) * 8 + 4, tCrC(2, i, j*2+1), tCrC(3, i, j*2+1), frag_s[j / 2][2 * (j % 2) + 1]);
         }
         c_sh_wr += 16 * (4 * c_sh_stride);
       }
