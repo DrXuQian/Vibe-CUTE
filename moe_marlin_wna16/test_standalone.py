@@ -1,57 +1,58 @@
-"""Standalone MOE-Marlin INT4 test. No vLLM test infra needed."""
+"""Standalone MOE-Marlin INT4 test using our W4A16 packing utility."""
 import sys
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
-sys.path.insert(0, '.')
+sys.path.insert(0, '/root/marlin/marlin_w4a16')
 DEV = torch.device("cuda:0")
 
 
-def gen_marlin_weight(k, n, group_size=-1, num_bits=4):
-    """Generate Marlin-formatted INT4 weights + scales + reference FP16."""
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        quantize_weights,
-        sort_weights,
-    )
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-        marlin_moe_permute_scales,
-    )
-    maxq = 2 ** num_bits - 1
+def pack_marlin_weight(k, n, groupsize=-1):
+    """Pack random INT4 weights into Marlin format using W4A16 Layer.pack()."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('marlin_w4a16', '/root/marlin/marlin_w4a16/__init__.py')
+    marlin_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(marlin_mod)
+
+    maxq = 2 ** 4 - 1
     w = torch.randn((k, n), dtype=torch.half, device=DEV)
-    if group_size > 0:
-        # grouped quantization
-        w_ref, q_w, s, _, _ = quantize_weights(w, num_bits, group_size, act_order=False)
-    else:
-        # per-channel
-        s = torch.max(torch.abs(w), 0, keepdim=True)[0]
-        s *= 2 / maxq
-        q_w = torch.round(w / s).int() + (maxq + 1) // 2
-        q_w = torch.clamp(q_w, 0, maxq)
-        w_ref = (q_w - (maxq + 1) // 2).half() * s
-        q_w = q_w.to(torch.int32)
-        s = s.reshape(1, n)
+    if groupsize != -1:
+        w = w.reshape((-1, groupsize, n))
+        w = w.permute(1, 0, 2)
+        w = w.reshape((groupsize, -1))
+    s = torch.max(torch.abs(w), 0, keepdim=True)[0]
+    s *= 2 / maxq
+    w_int = torch.round(w / s).int()
+    w_int += (maxq + 1) // 2
+    w_int = torch.clamp(w_int, 0, maxq)
+    ref = (w_int - (maxq + 1) // 2).half() * s
+    if groupsize != -1:
+        def reshape(w):
+            w = w.reshape((groupsize, -1, n))
+            w = w.permute(1, 0, 2)
+            w = w.reshape((k, n)).contiguous()
+            return w
+        ref = reshape(ref)
+        w_int = reshape(w_int)
+    s = s.reshape((-1, n)).contiguous()
+    linear = nn.Linear(k, n)
+    linear.weight.data = ref.t()
+    layer = marlin_mod.Layer(256, 256, groupsize=groupsize)
+    if groupsize == -1:
+        groupsize = k
+    layer.k = k
+    layer.n = n
+    layer.groupsize = groupsize
+    layer.B = torch.empty((k // 16, n * 16 // 8), dtype=torch.int, device=DEV)
+    layer.s = torch.empty((k // groupsize, n), dtype=torch.half, device=DEV)
+    layer.pack(linear, s.t())
+    return ref, layer.B, layer.s
 
-    # Pack to Marlin format
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-        marlin_sort_g_idx,
-    )
-    # Marlin weight packing: (k, n) int4 -> (k/16, n*16/pack) int32
-    tile = 16
-    pack_factor = 32 // num_bits
-    # Marlin uses a specific packing + permutation
-    # Use vllm's utility
-    perm = torch.empty(0, dtype=torch.int, device=DEV)
-    g_idx = torch.empty(0, dtype=torch.int, device=DEV)
 
-    # Simple pack: pack num_bits values into int32
-    # Marlin format: interleaved packing within tiles
-    from vllm._C import ops as vllm_ops
-    # If _C.ops is available, use it. Otherwise fallback.
-    raise NotImplementedError("Need vllm C ops for weight packing")
-
-
-def test_moe_marlin_basic():
-    """Test MOE Marlin with pre-packed weights via vLLM utilities."""
+def test_moe_marlin():
+    """Test MOE Marlin INT4 kernel against FP16 reference."""
+    sys.path.insert(0, '/root/marlin/moe_marlin_wna16')
     import moe_marlin_cuda
     from vllm.scalar_type import scalar_types
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
@@ -63,11 +64,11 @@ def test_moe_marlin_basic():
 
     torch.manual_seed(42)
 
-    # Problem dimensions
-    m, n, k = 16, 128, 256
+    m, n, k = 32, 256, 512
     num_experts = 4
     top_k = 2
     block_size_m = 16
+    groupsize = 128
 
     # Input
     a = torch.randn((m, k), dtype=torch.float16, device=DEV)
@@ -84,77 +85,73 @@ def test_moe_marlin_basic():
         topk_ids.to(torch.int32), block_size_m, num_experts
     )
 
-    # Create FP16 reference weights per expert (no actual quantization for now)
-    # Just verify the MOE dispatch works by using identity-like weights
-    w_ref = torch.randn((num_experts, k, n), dtype=torch.float16, device=DEV)
+    # Create per-expert Marlin-packed weights
+    w_ref_list, w_q_list, w_s_list = [], [], []
+    for e in range(num_experts):
+        ref, q, s = pack_marlin_weight(k, n, groupsize=groupsize)
+        w_ref_list.append(ref)
+        w_q_list.append(q)
+        w_s_list.append(s)
 
-    # Pack weights into Marlin format (k/16, n*16/8 in int32)
-    # For INT4: each int32 holds 8 INT4 values
-    # Marlin packing: tile_size=16, pack_factor=8
-    tile_size = 16
-    pack_factor = 8  # 32/4
+    w_ref = torch.stack(w_ref_list)
+    w_q = torch.stack(w_q_list)
+    w_s = torch.stack(w_s_list)
 
-    # Create packed weight tensor: (num_experts, k/tile_size, n*tile_size/pack_factor)
-    b_q = torch.zeros((num_experts, k // tile_size, n * tile_size // pack_factor),
-                       dtype=torch.int32, device=DEV)
+    # FP16 reference computation
+    c_ref = torch.zeros((m, n), dtype=torch.float16, device=DEV)
+    for i in range(m):
+        for t in range(top_k):
+            eid = topk_ids[i, t].item()
+            wt = topk_weights[i, t].item()
+            c_ref[i] += wt * (a[i:i+1] @ w_ref[eid]).squeeze(0)
 
-    # Create scales: per-column (group_size=-1)
-    # Shape: (num_experts, 1, n)
-    b_scales = torch.ones((num_experts, 1, n), dtype=torch.float16, device=DEV)
-
-    # For a simple smoke test, just verify the kernel runs without crashing
+    # Workspace
     workspace = marlin_make_workspace_new(DEV, max_blocks_per_sm=1)
-
     b_type_id = scalar_types.uint4b8.id
 
-    print(f"Testing MOE-Marlin: m={m} n={n} k={k} experts={num_experts} top_k={top_k}")
-    print(f"  a shape: {a.shape}")
-    print(f"  b_q shape: {b_q.shape}")
-    print(f"  b_scales shape: {b_scales.shape}")
-    print(f"  sorted_token_ids shape: {sorted_token_ids.shape}")
-    print(f"  expert_ids shape: {expert_ids.shape}")
+    print(f"MOE-Marlin test: m={m} n={n} k={k} experts={num_experts} top_k={top_k} gs={groupsize}")
 
     try:
-        c = moe_marlin_cuda.moe_wna16_marlin_gemm(
-            a,                          # a
-            None,                       # c (auto-alloc)
-            b_q,                        # b_q_weight
-            None,                       # b_bias
-            b_scales,                   # b_scales
-            None,                       # a_scales
-            None,                       # global_scale
-            None,                       # b_zeros
-            None,                       # g_idx
-            None,                       # perm
-            workspace,                  # workspace
-            sorted_token_ids,           # sorted_token_ids
-            expert_ids,                 # expert_ids
-            num_tokens_post_padded,     # num_tokens_past_padded
-            topk_weights,               # topk_weights
-            block_size_m,               # moe_block_size
-            top_k,                      # top_k
-            True,                       # mul_topk_weights
-            b_type_id,                  # b_q_type
-            m,                          # size_m
-            n,                          # size_n
-            k,                          # size_k
-            False,                      # is_k_full
-            False,                      # use_atomic_add
-            True,                       # use_fp32_reduce
-            False,                      # is_zp_float
-            -1,                         # thread_k
-            -1,                         # thread_n
-            1,                          # blocks_per_sm
+        c_marlin = moe_marlin_cuda.moe_wna16_marlin_gemm(
+            a, None, w_q, None, w_s,
+            None, None, None, None, None,
+            workspace, sorted_token_ids, expert_ids,
+            num_tokens_post_padded, topk_weights,
+            block_size_m, top_k, True,
+            b_type_id, m, n, k,
+            True, False, True, False,
+            -1, -1, 1,
         )
         torch.cuda.synchronize()
-        print(f"  Output shape: {c.shape}")
-        print(f"  Output sample: {c[0, :5]}")
-        print("  KERNEL RAN SUCCESSFULLY!")
+
+        # c_marlin shape: (m*top_k, n) — topk_weights already applied per row
+        # Need to sum over top_k for each token
+        c_marlin_2d = c_marlin.view(m, top_k, n)
+        c_marlin_reduced = c_marlin_2d.sum(dim=1)
+
+        rel_err = (torch.abs(c_marlin_reduced - c_ref).mean() / torch.abs(c_ref).mean()).item()
+        max_diff = torch.abs(c_marlin_reduced - c_ref).max().item()
+        print(f"  rel_err={rel_err:.6f} max_diff={max_diff:.4f}")
+        print(f"  c_ref[:2,:4]    = {c_ref[:2,:4]}")
+        print(f"  c_marlin[:2,:4] = {c_marlin_reduced[:2,:4]}")
+        if rel_err < 0.01:
+            print("  PASSED!")
+            return True
+        else:
+            print(f"  FAILED")
+            return False
     except Exception as e:
         print(f"  ERROR: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
+        return False
 
 
 if __name__ == "__main__":
-    test_moe_marlin_basic()
+    # First rebuild the module
+    import subprocess
+    subprocess.run(["python", "setup.py", "build_ext", "--inplace"],
+                   cwd="/root/marlin/marlin_w4a16",
+                   env={**__import__('os').environ, "TORCH_CUDA_ARCH_LIST": "8.0;12.0"},
+                   capture_output=True)
+    ok = test_moe_marlin()
+    exit(0 if ok else 1)
