@@ -726,25 +726,11 @@ __global__ void MarlinCuteMoe(
   auto write_result = [&] () {
     // Stage 1: FP32 -> FP16 + scale, then R2S via make_tiled_copy_C + retile_S
     // Convert tCrC (FP32) to FP16, applying per-column scale if needed
+    // FP32 → FP16 + per-column scale (topk_weights applied in S2G stage)
     auto tCrC_fp16 = make_tensor_like<cute::half_t>(tCrC);
     if (threadIdx.x / 32 < thread_n_blocks / 4) {
-      // MOE: optionally apply topk_weights per row
-      const int32_t* block_sorted_ids = cur_sorted_ids();
       #pragma unroll
       for (int m = 0; m < size<1>(tCrC); m++) {
-        // MOE topk_weight for this row
-        half2 topk_w = __float2half2_rn(1.0f);
-        if (mul_topk_weights) {
-          // Get the row's topk weight from the sorted token ID
-          int row_in_block = m * 16 + (threadIdx.x % 32) / 4;  // approximate row
-          if (row_in_block < moe_block_size) {
-            int32_t sorted_id = block_sorted_ids[row_in_block];
-            if (sorted_id < prob_m_top_k) {
-              float w = topk_weights[sorted_id];
-              topk_w = __float2half2_rn(w);
-            }
-          }
-        }
         #pragma unroll
         for (int n = 0; n < size<2>(tCrC); n++) {
           #pragma unroll
@@ -754,10 +740,6 @@ __global__ void MarlinCuteMoe(
             if (group_blocks == -1) {
               int j = n / 2, b = n % 2;
               res = __hmul2(res, frag_s[j / 2][2 * (j % 2) + b][0]);
-            }
-            // MOE: multiply by topk weight
-            if (mul_topk_weights) {
-              res = __hmul2(res, topk_w);
             }
             reinterpret_cast<half2*>(&tCrC_fp16(v, m, n))[0] = res;
           }
@@ -794,10 +776,17 @@ __global__ void MarlinCuteMoe(
       if (row < moe_block_size) {
         int32_t sorted_id = block_sorted_ids[row];
         if (sorted_id < prob_m_top_k) {
-          // Read from smem: sC(row, col) in half_t → read as int4
-          // smem layout: (M, N) half_t with stride (CTA_N + 8, 1)
-          int sh_idx = row * (CTA_N + 8) / 8 + c_tid_n;  // int4 index into padded smem
+          // Read from smem
+          int sh_idx = row * (CTA_N + 8) / 8 + c_tid_n;
           int4 val = sh[sh_idx];
+          // MOE: multiply by topk_weight if enabled
+          if (mul_topk_weights) {
+            half2 tw = __float2half2_rn(topk_weights[sorted_id]);
+            half2* val_h2 = reinterpret_cast<half2*>(&val);
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+              val_h2[i] = __hmul2(val_h2[i], tw);
+          }
           // Write to gmem at sorted position
           int gl_idx = sorted_id * c_gl_stride + C_N_INT4 * tile_work.n_idx + c_tid_n;
           C_int4[gl_idx] = val;
