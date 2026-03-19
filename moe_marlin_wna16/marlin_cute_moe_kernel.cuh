@@ -228,9 +228,7 @@ __global__ void MarlinCuteMoe(
   int n_tiles = prob_n / 16 / thread_n_blocks;
   int total_iters = k_tiles * n_tiles * parallel;
   int iters_per_block = ceildiv_cute(total_iters, gridDim.x);
-  // MOE: round up to multiple of k_tiles to prevent split-K
-  // This ensures each CTA handles complete tiles (no partial K)
-  iters_per_block = k_tiles * ceildiv_cute(iters_per_block, k_tiles);
+  // Re-enable split-K (invalid experts handled via no-op barrier participation)
   if (group_blocks != -1)
     iters_per_block = (group_blocks / thread_k_blocks) * ceildiv_cute(iters_per_block, (group_blocks / thread_k_blocks));
 
@@ -788,8 +786,17 @@ __global__ void MarlinCuteMoe(
               val_h2[i] = __hmul2(val_h2[i], tw);
           }
           // Write to gmem at sorted position
+          // Use atomicAdd for split-K accumulation (multiple CTAs may write same row)
           int gl_idx = sorted_id * c_gl_stride + C_N_INT4 * tile_work.n_idx + c_tid_n;
-          C_int4[gl_idx] = val;
+          if (tile_work.is_splited()) {
+            half2* dst = reinterpret_cast<half2*>(&C_int4[gl_idx]);
+            half2* src = reinterpret_cast<half2*>(&val);
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+              atomicAdd(dst + i, src[i]);
+          } else {
+            C_int4[gl_idx] = val;
+          }
         }
       }
     }
@@ -845,8 +852,8 @@ __global__ void MarlinCuteMoe(
     // ---- Epilog for current tile ----
     cute::cp_async_wait<0>();
 
-    // Per-column scales: fetch in the final step before write-out
-    if (group_blocks == -1 && tile_work.is_last()) {
+    // Per-column scales: ALL CTAs need scales for atomicAdd write path
+    if (group_blocks == -1) {
       if (s_sh_wr_pred) {
         auto src = make_tensor(make_gmem_ptr(&cur_s()[s_gl_rd]), Int<1>{});
         auto dst = make_tensor(make_smem_ptr(&sh_s[s_sh_wr]), Int<1>{});
@@ -857,7 +864,7 @@ __global__ void MarlinCuteMoe(
 
     thread_block_reduce();
 
-    if (group_blocks == -1 && tile_work.is_last()) {
+    if (group_blocks == -1) {
       cute::cp_async_wait<0>();
       __syncthreads();
       if (threadIdx.x / 32 < thread_n_blocks / 4) {
@@ -866,9 +873,8 @@ __global__ void MarlinCuteMoe(
       }
     }
 
-    // MOE: disable split-K for now (each CTA handles complete K for its tile)
-    // Split-K requires careful barrier management across expert boundaries
-    // TODO: implement MOE-aware split-K with per-expert lock management
+    // MOE: always write results (use atomicAdd for split-K accumulation)
+    // No barrier needed — atomic operations handle concurrent writes
     if (cur_expert_id() >= 0)
       write_result();
 
