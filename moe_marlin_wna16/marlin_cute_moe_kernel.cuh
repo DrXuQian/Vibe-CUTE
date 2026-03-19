@@ -63,6 +63,19 @@ constexpr int ceildiv_cute(int a, int b) {
 
 namespace marlin_cute {
 
+// Predicated cp.async 16B (for MOE scattered A fetch)
+__device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool pred = true) {
+  const int BYTES = 16;
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+    "{\n"
+    "   .reg .pred p;\n"
+    "   setp.ne.b32 p, %0, 0;\n"
+    "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
+    "}\n" :: "r"((int) pred), "r"(smem), "l"(glob_ptr), "n"(BYTES)
+  );
+}
+
 // lop3: 3-input logical operation (used by INT4 dequantization)
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
@@ -204,11 +217,12 @@ __global__ void MarlinCuteMoe(
     __device__ bool is_splited() const { return slice_count > 1; }
   };
 
-  // MOE: parallel = number of MOE blocks (each block_size tokens mapped to one expert)
+  // MOE: parallel = total MOE blocks (including invalid expert_id=-1 blocks)
   constexpr int moe_block_size = 16 * thread_m_blocks;
   int parallel = num_tokens_post_padded[0] / moe_block_size;
+  if (parallel == 0) return;
   prob_m = moe_block_size;
-  int prob_m_top_k = prob_m * top_k;  // for token validity check
+  int prob_m_top_k = prob_m * top_k;
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
@@ -430,36 +444,32 @@ __global__ void MarlinCuteMoe(
   auto fetch_to_shared = [&] (int pipe, int a_off, bool pred = true) {
     if (pred) {
       // --- A matrix: GMEM -> SMEM with MOE token routing ---
-      // Each row is fetched from sorted_token_ids[row] / top_k position in A
-      // Cannot use contiguous TiledCopy — rows are scattered
+      // Rows are scattered via sorted_token_ids — use manual cp.async with CuTe smem layout
       auto sA_stage = make_tensor(
         make_smem_ptr(reinterpret_cast<cute::half_t*>(sh_a + a_sh_stage * pipe)),
         SmemLayoutA{}
       );
-      auto tAsA = gmem_thr_copy_a.partition_D(sA_stage);
-      auto gA_identity = make_identity_tensor(make_shape(Int<A_TILE_M>{}, Int<A_TILE_K_HALF>{}));
-      auto tAgA_id = gmem_thr_copy_a.partition_S(gA_identity);
-      // Per-row: look up sorted_token_ids to find actual A row
+      constexpr int A_COPY_THREADS = A_TILE_K_INT4;  // threads per row
+      int a_tid_row = threadIdx.x / A_COPY_THREADS;  // which row this thread loads
+      int a_tid_col = (threadIdx.x % A_COPY_THREADS) * 8;  // col in half_t (8 per int4)
+      constexpr int A_ROWS_PER_ITER = threads / A_COPY_THREADS;
+      constexpr int A_ITERS = ceildiv_cute(A_TILE_M, A_ROWS_PER_ITER);
       const int32_t* block_sorted_ids = cur_sorted_ids();
       const cute::half_t* A_half = reinterpret_cast<const cute::half_t*>(A);
       int k_col_offset = a_k_col + A_TILE_K_HALF * a_off;
       #pragma unroll
-      for (int m = 0; m < size<1>(tAsA); m++) {
-        int row_in_block = get<0>(tAgA_id(_0{}, m, _0{}));
-        int32_t sorted_id = block_sorted_ids[row_in_block];
-        int32_t actual_row = sorted_id / top_k;
-        bool valid = sorted_id < prob_m_top_k && row_in_block < moe_block_size;
-        if (valid) {
-          // Create per-row gmem tensor at the actual A position
-          auto gA_row = make_tensor(
-            make_gmem_ptr(A_half + actual_row * prob_k + k_col_offset),
-            make_shape(Int<1>{}, Int<A_TILE_K_HALF>{}),
-            make_stride(prob_k, Int<1>{})
+      for (int i = 0; i < A_ITERS; i++) {
+        int row = a_tid_row + i * A_ROWS_PER_ITER;
+        if (row < moe_block_size) {
+          int32_t sorted_id = block_sorted_ids[row];
+          bool valid = sorted_id < prob_m_top_k;
+          int32_t actual_row = valid ? sorted_id / top_k : 0;
+          // Write to swizzled smem via CuTe layout, read from scattered gmem
+          marlin_cute::cp_async4_pred(
+            &sA_stage(row, a_tid_col),
+            &A_half[actual_row * prob_k + k_col_offset + a_tid_col],
+            valid
           );
-          auto tAgA_row = gmem_thr_copy_a.partition_S(gA_row);
-          #pragma unroll
-          for (int k = 0; k < size<2>(tAsA); k++)
-            copy(gmem_tiled_copy_a, tAgA_row(_, _0{}, k), tAsA(_, m, k));
         }
       }
 
@@ -811,7 +821,9 @@ __global__ void MarlinCuteMoe(
     fetch_to_registers(0, 0);
     a_k_col += A_TILE_K_HALF * (stages - 1);
   };
-  start_pipes();
+  // Skip tiles with invalid expert_id (-1)
+  if (cur_expert_id() >= 0)
+    start_pipes();
 
   // ========================================================================
   // Main Loop
@@ -819,6 +831,25 @@ __global__ void MarlinCuteMoe(
 
   #pragma unroll 1
   while (true) {
+    // MOE: skip tiles with invalid expert
+    if (cur_expert_id() < 0) {
+      remaining_iters -= tile_work.k_iters_remaining;
+      if (remaining_iters <= 0) break;
+      tile_idx++;
+      tile_work.init(k_tiles, n_tiles, iters_per_block, tile_idx, block_iter_begin, block_iter_end);
+      if (cur_expert_id() >= 0) {
+        a_k_col = A_TILE_K_HALF * tile_work.k_iter_begin;
+        b_k_row = thread_k_blocks * tile_work.k_iter_begin;
+        b_n_col = b_sh_stride * tile_work.n_idx;
+        if constexpr (group_blocks != -1)
+          s_gl_rd = s_gl_stride * ((thread_k_blocks * tile_work.k_iter_begin) / group_blocks)
+                  + s_sh_stride * tile_work.n_idx + threadIdx.x;
+        else
+          s_gl_rd = s_sh_stride * tile_work.n_idx + threadIdx.x;
+        start_pipes();
+      }
+      continue;
+    }
     remaining_iters -= tile_work.k_iters_remaining;
 
     // Main K loop for current tile
@@ -867,15 +898,9 @@ __global__ void MarlinCuteMoe(
       }
     }
 
-    // Inter-CTA global reduce (only when tile is split across CTAs)
-    // slice_idx=0 (highest K) goes first → no wait on initial lock=0
-    if (tile_work.is_splited()) {
-      marlin_cute::barrier_acquire(&cur_locks()[tile_work.n_idx], tile_work.slice_idx);
-      global_reduce(tile_work.is_first(), tile_work.is_last());
-      marlin_cute::barrier_release(&cur_locks()[tile_work.n_idx], tile_work.is_last());
-    }
-    if (tile_work.is_last())
-      write_result();
+    // MOE: For now, disable split-K barrier (each tile writes independently)
+    // TODO: proper MOE lock management
+    write_result();
 
     if (remaining_iters <= 0)
       break;
